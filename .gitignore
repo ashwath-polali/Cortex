@@ -1,0 +1,11 @@
+brain/*
+!brain/.gitkeep
+!brain/README.md
+.env
+*.env
+__pycache__/
+*.pyc
+.DS_Store
+.claude/
+.vercel/
+CLAUDE.md
