@@ -2,7 +2,6 @@ import os
 import json
 import re
 import time
-import requests as http
 from functools import wraps
 from datetime import date, timedelta
 from flask import Flask, request, jsonify, send_file, session, redirect
@@ -27,36 +26,19 @@ CORTEX_PASSWORD = os.getenv("CORTEX_PASSWORD", "")
 CORTEX_MCP_KEY = os.getenv("CORTEX_MCP_KEY", "")
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
-AW_ENDPOINT = os.getenv("APPWRITE_ENDPOINT", "https://cloud.appwrite.io/v1")
-AW_PROJECT = os.getenv("APPWRITE_PROJECT_ID", "")
-AW_KEY = os.getenv("APPWRITE_API_KEY", "")
-DB_ID = os.getenv("APPWRITE_DATABASE_ID", "")
-COL_ID = os.getenv("APPWRITE_COLLECTION_ID", "")
-AW_BASE = f"{AW_ENDPOINT}/databases/{DB_ID}/collections/{COL_ID}/documents"
-AW_HEADERS = {"X-Appwrite-Project": AW_PROJECT, "X-Appwrite-Key": AW_KEY}
+from db import db_list, db_find, db_create, db_update, db_delete
 
 def aw_list():
-    r = http.get(AW_BASE, headers=AW_HEADERS)
-    r.raise_for_status()
-    data = r.json()
-    data["documents"] = [d for d in data["documents"] if not d["filename"].startswith("__")]
-    return data
+    return {"documents": db_list()}
 
 def aw_create(data):
-    r = http.post(AW_BASE, headers={**AW_HEADERS, "Content-Type": "application/json"},
-                  json={"documentId": "unique()", "data": data})
-    r.raise_for_status()
-    return r.json()
+    return db_create(data["filename"], data.get("content", ""))
 
 def aw_update(doc_id, data):
-    r = http.patch(f"{AW_BASE}/{doc_id}", headers={**AW_HEADERS, "Content-Type": "application/json"},
-                   json={"data": data})
-    r.raise_for_status()
-    return r.json()
+    db_update(doc_id, data["content"])
 
 def aw_delete(doc_id):
-    r = http.delete(f"{AW_BASE}/{doc_id}", headers=AW_HEADERS)
-    r.raise_for_status()
+    db_delete(doc_id)
 
 SEED_TEMPLATES = [
     {"filename": "core.md", "content": "## identity\n- name:\n- location:\n- goal:\n"},
@@ -1078,11 +1060,7 @@ MCP_DISPATCH = {
 
 def _aw_activity_doc():
     try:
-        r = http.get(AW_BASE, headers=AW_HEADERS)
-        for d in r.json().get("documents", []):
-            if d["filename"] == "__activity__":
-                return d
-        return None
+        return db_find("__activity__")
     except Exception:
         return None
 
@@ -1096,17 +1074,9 @@ def _track(cluster, action="read", source=""):
             old = doc["content"].strip().split("\n") if doc["content"].strip() else []
             old.append(event)
             old = old[-30:]
-            http.patch(
-                f"{AW_BASE}/{doc['$id']}",
-                headers={**AW_HEADERS, "Content-Type": "application/json"},
-                json={"data": {"content": "\n".join(old)}}
-            )
+            db_update(doc["$id"], "\n".join(old))
         else:
-            http.post(
-                AW_BASE,
-                headers={**AW_HEADERS, "Content-Type": "application/json"},
-                json={"documentId": "unique()", "data": {"filename": "__activity__", "content": event}}
-            )
+            db_create("__activity__", event)
     except Exception:
         pass
 

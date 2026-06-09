@@ -7,11 +7,9 @@
 #       "command": "python",
 #       "args": ["/path/to/Cortex/mcp_server.py"],
 #       "env": {
-#         "APPWRITE_ENDPOINT": "https://cloud.appwrite.io/v1",
-#         "APPWRITE_PROJECT_ID": "...",
-#         "APPWRITE_API_KEY": "...",
-#         "APPWRITE_DATABASE_ID": "...",
-#         "APPWRITE_COLLECTION_ID": "..."
+#         "MONGODB_URI": "mongodb+srv://...",
+#         "MONGODB_DB": "cortex",
+#         "MONGODB_COLLECTION": "memories"
 #       }
 #     }
 #   }
@@ -27,30 +25,19 @@
 
 import os
 import re
-import requests as http
 from datetime import date
 from difflib import SequenceMatcher
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
+from db import db_list, db_find, db_create, db_update, db_delete
 
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 
-AW_ENDPOINT = os.getenv("APPWRITE_ENDPOINT", "https://cloud.appwrite.io/v1")
-AW_PROJECT = os.getenv("APPWRITE_PROJECT_ID", "")
-AW_KEY = os.getenv("APPWRITE_API_KEY", "")
-DB_ID = os.getenv("APPWRITE_DATABASE_ID", "")
-COL_ID = os.getenv("APPWRITE_COLLECTION_ID", "")
-AW_BASE = f"{AW_ENDPOINT}/databases/{DB_ID}/collections/{COL_ID}/documents"
-AW_HEADERS = {"X-Appwrite-Project": AW_PROJECT, "X-Appwrite-Key": AW_KEY}
 import json as _json
 import time as _time
 
 def _aw_activity_doc():
-    r = http.get(AW_BASE, headers=AW_HEADERS, params={"limit": 100})
-    for d in r.json().get("documents", []):
-        if d["filename"] == "__activity__":
-            return d
-    return None
+    return db_find("__activity__")
 
 def emit_activity(cluster, action="read", source=""):
     try:
@@ -60,19 +47,9 @@ def emit_activity(cluster, action="read", source=""):
             old = doc["content"].strip().split("\n") if doc["content"].strip() else []
             old.append(event)
             old = old[-30:]
-            http.patch(
-                f"{AW_BASE}/{doc['$id']}",
-                headers={**AW_HEADERS, "Content-Type": "application/json"},
-                json={"data": {"content": "\n".join(old)}},
-                timeout=1
-            )
+            db_update(doc["$id"], "\n".join(old))
         else:
-            http.post(
-                AW_BASE,
-                headers={**AW_HEADERS, "Content-Type": "application/json"},
-                json={"documentId": "unique()", "data": {"filename": "__activity__", "content": event}},
-                timeout=1
-            )
+            db_create("__activity__", event)
     except Exception:
         pass
 
@@ -116,9 +93,7 @@ def extract_doc_keywords(doc):
 
 
 def aw_list():
-    r = http.get(AW_BASE, headers=AW_HEADERS, params={"limit": 100})
-    r.raise_for_status()
-    return [d for d in r.json()["documents"] if not d["filename"].startswith("__")]
+    return db_list()
 
 
 def get_scope(doc):
@@ -388,11 +363,7 @@ def save_to_brain(filename: str, bullet: str, section: str = "", tier: str = "ac
         if not content.endswith("\n"):
             content += "\n"
         content += bullet + "\n"
-    http.patch(
-        f"{AW_BASE}/{doc['$id']}",
-        headers={**AW_HEADERS, "Content-Type": "application/json"},
-        json={"data": {"content": content}},
-    ).raise_for_status()
+    db_update(doc["$id"], content)
     target = f"{filename} > {section}" if section else filename
     emit_activity(filename, "write", source)
     return f"saved to {target}: {bullet}"
@@ -426,11 +397,7 @@ def create_cluster(filename: str, content: str, source: str = "", scope: str = "
     final = "\n".join(stamped)
     if not final.endswith("\n"):
         final += "\n"
-    http.post(
-        AW_BASE,
-        headers={**AW_HEADERS, "Content-Type": "application/json"},
-        json={"documentId": "unique()", "data": {"filename": filename, "content": final}},
-    ).raise_for_status()
+    db_create(filename, final)
     emit_activity(filename, "write", source)
     return f"created {filename} [{scope or 'all'}] with {sum(1 for l in stamped if l.strip().startswith('- '))} bullets"
 
@@ -465,11 +432,7 @@ def edit_bullet(filename: str, old_text: str, new_text: str, source: str = "") -
         new_text = new_text.rstrip() + " " + meta
     lines[match_idx] = new_text
     content = "\n".join(lines)
-    http.patch(
-        f"{AW_BASE}/{doc['$id']}",
-        headers={**AW_HEADERS, "Content-Type": "application/json"},
-        json={"data": {"content": content}},
-    ).raise_for_status()
+    db_update(doc["$id"], content)
     emit_activity(filename, "write", source)
     return f"edited in {filename}: '{old_text.strip()}' → '{new_text.strip()}'"
 
@@ -494,11 +457,7 @@ def delete_bullet(filename: str, old_text: str) -> str:
         return f"no bullet matching '{old_text}' found in {filename}"
     removed = lines.pop(match_idx)
     content = "\n".join(lines)
-    http.patch(
-        f"{AW_BASE}/{doc['$id']}",
-        headers={**AW_HEADERS, "Content-Type": "application/json"},
-        json={"data": {"content": content}},
-    ).raise_for_status()
+    db_update(doc["$id"], content)
     emit_activity(filename, "write")
     return f"deleted from {filename}: {removed.strip()}"
 
@@ -532,11 +491,7 @@ def delete_section(filename: str, section: str) -> str:
     removed_count = sum(1 for l in lines[start_idx:end_idx] if l.strip().startswith("- "))
     del lines[start_idx:end_idx]
     content = "\n".join(lines)
-    http.patch(
-        f"{AW_BASE}/{doc['$id']}",
-        headers={**AW_HEADERS, "Content-Type": "application/json"},
-        json={"data": {"content": content}},
-    ).raise_for_status()
+    db_update(doc["$id"], content)
     emit_activity(filename, "write")
     return f"deleted section '{section}' ({removed_count} bullets) from {filename}"
 
