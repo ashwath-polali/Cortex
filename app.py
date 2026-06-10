@@ -120,7 +120,7 @@ def files_as_text(files):
     return "\n".join(f"=== {k} ===\n{v}" for k, v in files.items())
 
 
-def tier_filtered_text(files, include_temp=False):
+def importance_filtered_text(files, include_low=False):
     parts = []
     for fname, content in files.items():
         lines = content.split("\n")
@@ -129,11 +129,11 @@ def tier_filtered_text(files, include_temp=False):
             stripped = line.strip()
             if stripped.startswith("- "):
                 meta = parse_meta(stripped[2:])
-                if not include_temp and meta["tier"] == "temp":
+                imp = meta["importance"]
+                if not include_low and imp <= 1:
                     continue
-                tier_label = meta["tier"]
-                if tier_label == "core":
-                    filtered.append(line + "  [CORE]")
+                if imp >= 4:
+                    filtered.append(line + "  [i" + str(imp) + "]")
                 else:
                     filtered.append(line)
             else:
@@ -150,15 +150,27 @@ def select_files_with_core(topic, all_docs, max_files=3):
     return selected
 
 
+LEGACY_TIER_IMP = {"core": 5, "active": 3, "ref": 2, "temp": 1}
+
+
+def clamp_importance(v):
+    try:
+        n = int(v)
+    except (TypeError, ValueError):
+        return 3
+    return 1 if n < 1 else 5 if n > 5 else n
+
+
 def parse_meta(text):
     m = re.search(r'\{\{([^}]+)\}\}', text)
     if not m:
-        return {'text': text.strip(), 'created': None, 'reviewed': None, 'tier': 'active', 'tags': [], 'expiry': None, 'source': None}
+        return {'text': text.strip(), 'created': None, 'reviewed': None, 'importance': 3, 'tags': [], 'expiry': None, 'source': None, 'rec': None}
     clean = text[:m.start()].rstrip()
     parts = m.group(1).split('|')
     created = parts[0] if parts else None
     reviewed = None
-    tier = 'active'
+    importance = None
+    legacy_tier = None
     tags = []
     expiry = None
     source = None
@@ -166,8 +178,10 @@ def parse_meta(text):
     for p in parts[1:]:
         if p.startswith('r:'):
             reviewed = p[2:]
+        elif p.startswith('i:'):
+            importance = clamp_importance(p[2:])
         elif p.startswith('t:'):
-            tier = p[2:]
+            legacy_tier = p[2:]
         elif p.startswith('#'):
             tags = [t.strip() for t in p[1:].split(',') if t.strip()]
         elif p.startswith('x:'):
@@ -176,13 +190,15 @@ def parse_meta(text):
             source = p[2:]
         elif p.startswith('rec:'):
             rec = p[4:]
-    return {'text': clean, 'created': created, 'reviewed': reviewed, 'tier': tier, 'tags': tags, 'expiry': expiry, 'source': source, 'rec': rec}
+    if importance is None:
+        importance = LEGACY_TIER_IMP.get(legacy_tier, 3)
+    return {'text': clean, 'created': created, 'reviewed': reviewed, 'importance': importance, 'tags': tags, 'expiry': expiry, 'source': source, 'rec': rec}
 
 
-def stamp_bullet(line, tier="active", expiry=None, source=None, rec=None):
+def stamp_bullet(line, importance=3, expiry=None, source=None, rec=None):
     if re.search(r"\{\{\d{4}-\d{2}-\d{2}", line):
         return line
-    meta = "{{" + date.today().isoformat() + "|t:" + tier
+    meta = "{{" + date.today().isoformat() + "|i:" + str(clamp_importance(importance))
     if source:
         meta += "|s:" + source
     if expiry:
@@ -384,7 +400,7 @@ def brain():
                     continue
                 nodes.append({
                     "text": meta["text"],
-                    "tier": meta["tier"],
+                    "importance": meta["importance"],
                     "created": meta["created"],
                     "reviewed": meta.get("reviewed"),
                     "tags": meta["tags"],
@@ -435,11 +451,13 @@ def save():
             "- bullet to the most appropriate brain file.\n\n"
             f"Available files:\n{file_overview}\n\n"
             f"Most relevant files (check for duplicates before adding):\n{relevant_preview}\n\n"
-            "For each fact, assign a memory tier:\n"
-            "- core: permanent identity facts (name, school, family, core traits)\n"
-            "- active: current projects, goals, ongoing work, recent events\n"
-            "- ref: past achievements, reference info, completed work\n"
-            "- temp: short-lived info (upcoming events, temporary tasks) — include expiry YYYY-MM-DD\n\n"
+            "For each fact, assign an importance from 1 to 5 (how much this matters to the user long-term):\n"
+            "- 5: life-defining identity, values, major goals, pivotal events\n"
+            "- 4: major ongoing projects, key relationships, hard commitments\n"
+            "- 3: normal useful facts, preferences, active work (default)\n"
+            "- 2: minor details, reference info, secondary or past items\n"
+            "- 1: trivial or short-lived notes\n"
+            "For genuinely time-bound facts also set an expiry date YYYY-MM-DD (auto-deletes after).\n\n"
             "IMPORTANT: Check the existing content above. Do NOT add facts that already exist. "
             "If a fact updates an existing one, still add it (the user will resolve conflicts).\n\n"
             + (f"The user wants to save to: {target_hint}\n\n" if target_hint else "")
@@ -447,7 +465,7 @@ def save():
             "If the user says 'new cluster', 'new file', or 'new markdown', create a new file. "
             "Do not rewrite existing content. Do not add headers. "
             'Respond ONLY with valid JSON: '
-            '{"updates": [{"file": "filename.md", "line": "- fact text", "tier": "active", "expiry": null}]}. '
+            '{"updates": [{"file": "filename.md", "line": "- fact text", "importance": 3, "expiry": null}]}. '
             "No other text."
         )
         resp = client.messages.create(
@@ -468,11 +486,9 @@ def save():
         existing = {d["filename"]: d for d in all_docs}
         has_conflicts = False
         for u in updates:
-            tier = u.get("tier", "active")
-            if tier not in ("core", "active", "ref", "temp"):
-                tier = "active"
-            expiry = u.get("expiry") if tier == "temp" else None
-            u["line"] = stamp_bullet(u["line"], tier=tier, expiry=expiry, source="manual")
+            importance = clamp_importance(u.get("importance", 3))
+            expiry = u.get("expiry") or None
+            u["line"] = stamp_bullet(u["line"], importance=importance, expiry=expiry, source="manual")
             if u["file"] in existing:
                 conflicts = find_conflicts(u["line"], existing[u["file"]]["content"])
                 if conflicts:
@@ -544,7 +560,7 @@ def context():
 
         if mode == "compact":
             files = select_files_with_core(topic, all_docs, max_files=2)
-            brain_text = tier_filtered_text(files)
+            brain_text = importance_filtered_text(files)
             sys_prompt = (
                 "Generate a compact context handoff for another AI.\n"
                 "Third person only.\n"
@@ -586,7 +602,7 @@ def context():
             files = select_files_with_core(topic, all_docs, max_files=6)
             if not topic:
                 files = {d["filename"]: d["content"] for d in all_docs if not d["filename"].startswith("_")}
-            brain_text = tier_filtered_text(files, include_temp=True)
+            brain_text = importance_filtered_text(files, include_low=True)
             sys_prompt = (
                 "Generate a comprehensive context handoff for another AI assistant. "
                 "Third person only ('The user is...', 'They are...'). "
@@ -611,7 +627,7 @@ def context():
 
         else:
             files = select_files_with_core(topic, all_docs, max_files=3)
-            brain_text = tier_filtered_text(files)
+            brain_text = importance_filtered_text(files)
             sys_prompt = (
                 "Generate a structured context handoff for another AI. "
                 "Third person only ('The user is...', 'They are...'). "
@@ -720,7 +736,7 @@ def chat():
         compact = request.json.get("compact", False)
         all_docs = aw_list()["documents"]
         files = select_files_with_core(msg, all_docs, max_files=3)
-        brain_text = tier_filtered_text(files)
+        brain_text = importance_filtered_text(files)
         suffix = (
             "\n\nIMPORTANT: Bare minimum words. Key facts only. No filler. Extreme brevity."
             if compact else ""
@@ -763,8 +779,13 @@ MCP_TOOLS = [
     },
     {
         "name": "save_to_brain",
-        "description": "Append a new memory to a brain cluster. Assign an appropriate tier: core (permanent), active (current), ref (past), temp (short-lived — set expiry).",
-        "inputSchema": {"type": "object", "properties": {"filename": {"type": "string", "description": "Target cluster filename"}, "bullet": {"type": "string", "description": "Fact to save as a bullet point"}, "section": {"type": "string", "description": "Target ## section name inside the cluster. Read the cluster first to find section names."}, "tier": {"type": "string", "enum": ["core", "active", "ref", "temp"], "description": "Memory tier"}, "expiry": {"type": "string", "description": "Expiry date YYYY-MM-DD for temp tier"}, "source": {"type": "string", "description": "Source client (claude, perplexity, etc)"}, "rec": {"type": "string", "enum": ["pending", "confirmed"], "description": "Recommendation status. Use 'pending' when saving an AI recommendation. Use 'confirmed' when upgrading a recommendation the user accepted. Omit for normal factual memories."}}, "required": ["filename", "bullet"]},
+        "description": "Append a new memory to a brain cluster. REQUIRED: give every memory an importance 1-5 (5=life-defining identity/values/major goals, 4=major projects/key relationships/hard commitments, 3=normal useful fact, 2=minor/secondary detail, 1=trivial or short-lived). Save freely - do not skip saving useful info; just rank it honestly. Put one complete thought per bullet; if a fact directly continues/extends another, pass 'parent' to nest it as a sub-bullet instead of creating a dangling separate bullet.",
+        "inputSchema": {"type": "object", "properties": {"filename": {"type": "string", "description": "Target cluster filename"}, "bullet": {"type": "string", "description": "Fact to save as a bullet point (one complete thought)"}, "importance": {"type": "integer", "minimum": 1, "maximum": 5, "description": "1-5 importance. Required - rank honestly."}, "section": {"type": "string", "description": "Target ## section name inside the cluster. Read the cluster first to find section names."}, "parent": {"type": "string", "description": "Optional: a unique substring of an existing bullet this fact continues/extends. Nests this as a sub-bullet under it instead of a separate sibling."}, "expiry": {"type": "string", "description": "Optional expiry date YYYY-MM-DD for genuinely time-bound facts (auto-deletes after)"}, "source": {"type": "string", "description": "Source client (claude, perplexity, etc)"}, "rec": {"type": "string", "enum": ["pending", "confirmed"], "description": "Recommendation status. Use 'pending' when saving an AI recommendation. Use 'confirmed' when upgrading a recommendation the user accepted. Omit for normal factual memories."}}, "required": ["filename", "bullet", "importance"]},
+    },
+    {
+        "name": "set_importance",
+        "description": "Update the 1-5 importance ranking of an existing memory bullet. Use when re-evaluating how much a memory matters.",
+        "inputSchema": {"type": "object", "properties": {"filename": {"type": "string", "description": "Cluster filename"}, "bullet_text": {"type": "string", "description": "Unique substring of the bullet to re-rank"}, "importance": {"type": "integer", "minimum": 1, "maximum": 5, "description": "New 1-5 importance"}}, "required": ["filename", "bullet_text", "importance"]},
     },
     {
         "name": "create_cluster",
@@ -884,33 +905,47 @@ def _insert_under_section(content, section, bullet):
     return "\n".join(lines)
 
 
-def mcp_save_to_brain(filename, bullet, tier="active", expiry=None, source=None, section=None, rec=None):
+def mcp_save_to_brain(filename, bullet, importance=3, expiry=None, source=None, section=None, rec=None, parent=None):
     if not filename.endswith(".md"):
         filename += ".md"
-    if not bullet.startswith("- "):
-        bullet = "- " + bullet
-    if tier not in ("core", "active", "ref", "temp"):
-        tier = "active"
-    if tier != "temp":
-        expiry = None
+    bullet = bullet.strip()
+    if bullet.startswith("- "):
+        bullet = bullet[2:].strip()
     if not source:
         source = "mcp"
     if rec and rec not in ("pending", "confirmed"):
         rec = None
-    bullet = stamp_bullet(bullet, tier=tier, expiry=expiry, source=source, rec=rec)
+    importance = clamp_importance(importance)
     docs = aw_list()["documents"]
     for doc in docs:
         if doc["filename"] == filename:
+            lines = doc["content"].split("\n")
+            if parent:
+                pidx = -1
+                for i, line in enumerate(lines):
+                    if line.strip().startswith("- ") and parent.strip() in line:
+                        pidx = i
+                        break
+                if pidx == -1:
+                    return f"parent bullet matching '{parent}' not found in {filename}"
+                child = stamp_bullet("  - " + bullet, importance=importance, expiry=expiry, source=source, rec=rec)
+                ins = pidx + 1
+                while ins < len(lines) and lines[ins].startswith("  - "):
+                    ins += 1
+                lines.insert(ins, child)
+                aw_update(doc["$id"], {"content": "\n".join(lines)})
+                return f"saved under '{parent.strip()}' in {filename}: {child.strip()}"
+            stamped = stamp_bullet("- " + bullet, importance=importance, expiry=expiry, source=source, rec=rec)
             content = doc["content"]
             if section:
-                content = _insert_under_section(content, section, bullet)
+                content = _insert_under_section(content, section, stamped)
             else:
                 if not content.endswith("\n"):
                     content += "\n"
-                content += bullet + "\n"
+                content += stamped + "\n"
             aw_update(doc["$id"], {"content": content})
             target = f"{filename} > {section}" if section else filename
-            return f"saved to {target}: {bullet}"
+            return f"saved to {target}: {stamped}"
     available = [d["filename"] for d in docs]
     return f"'{filename}' not found. Available: {', '.join(available)}"
 
@@ -931,7 +966,7 @@ def mcp_create_cluster(filename, content, source=None, scope=None):
     for line in lines:
         stripped = line.strip()
         if stripped.startswith("- ") and not re.search(r"\{\{\d{4}-\d{2}-\d{2}", stripped):
-            meta = "{{" + date.today().isoformat() + "|t:active|s:" + source + "}}"
+            meta = "{{" + date.today().isoformat() + "|i:3|s:" + source + "}}"
             stamped.append(stripped.rstrip() + " " + meta)
         else:
             stamped.append(line)
@@ -965,12 +1000,15 @@ def mcp_edit_bullet(filename, old_text, new_text, source=None):
                     break
             if match_idx == -1:
                 return f"no bullet matching '{old_text}' found in {filename}"
+            old_line = lines[match_idx]
+            indent = "  " if (old_line.startswith("  - ") or old_line.startswith("\t- ")) else ""
+            old_imp = parse_meta(old_line.strip()[2:])["importance"] if old_line.strip().startswith("- ") else 3
             if not new_text.startswith("- "):
                 new_text = "- " + new_text
             if not source:
                 source = "mcp"
-            new_text = stamp_bullet(new_text, tier="active", source=source)
-            lines[match_idx] = new_text
+            new_text = stamp_bullet(new_text, importance=old_imp, source=source)
+            lines[match_idx] = indent + new_text
             content = "\n".join(lines)
             aw_update(doc["$id"], {"content": content})
             return f"edited in {filename}: '{old_text.strip()}' → '{new_text.strip()}'"
@@ -1031,6 +1069,33 @@ def mcp_delete_section(filename, section):
     return f"'{filename}' not found. Available: {', '.join(available)}"
 
 
+def _set_line_importance(line, importance):
+    if "{{" not in line:
+        return stamp_bullet(line, importance=importance)
+    line = re.sub(r"\|t:\w+", "", line)
+    if re.search(r"\|i:\d", line):
+        return re.sub(r"\|i:\d+", "|i:" + str(importance), line)
+    return re.sub(r"(\{\{\d{4}-\d{2}-\d{2})", r"\1|i:" + str(importance), line, count=1)
+
+
+def mcp_set_importance(filename, bullet_text, importance):
+    if not filename.endswith(".md"):
+        filename += ".md"
+    importance = clamp_importance(importance)
+    docs = aw_list()["documents"]
+    for doc in docs:
+        if doc["filename"] == filename:
+            lines = doc["content"].split("\n")
+            for i, line in enumerate(lines):
+                if line.strip().startswith("- ") and bullet_text.strip() in line:
+                    lines[i] = _set_line_importance(line, importance)
+                    aw_update(doc["$id"], {"content": "\n".join(lines)})
+                    return f"set importance {importance} on: {bullet_text.strip()}"
+            return f"no bullet matching '{bullet_text}' in {filename}"
+    available = [d["filename"] for d in docs]
+    return f"'{filename}' not found. Available: {', '.join(available)}"
+
+
 def _d(fn, cluster=None, action="read"):
     def wrapper(args):
         result = fn(args)
@@ -1047,10 +1112,11 @@ MCP_DISPATCH = {
     "list_clusters": _d(lambda args: mcp_list_clusters()),
     "search_brain": _d(lambda args: mcp_search_brain(args["query"])),
     "get_context_for_topic": _d(lambda args: mcp_get_context_for_topic(args["topic"])),
-    "save_to_brain": _d(lambda args: mcp_save_to_brain(args["filename"], args["bullet"], args.get("tier", "active"), args.get("expiry"), args.get("source"), args.get("section"), args.get("rec")), "filename", "write"),
+    "save_to_brain": _d(lambda args: mcp_save_to_brain(args["filename"], args["bullet"], args.get("importance", 3), args.get("expiry"), args.get("source"), args.get("section"), args.get("rec"), args.get("parent")), "filename", "write"),
     "create_cluster": _d(lambda args: mcp_create_cluster(args["filename"], args["content"], args.get("source"), args.get("scope")), "filename", "write"),
     "get_brain_summary": _d(lambda args: mcp_get_brain_summary()),
     "edit_bullet": _d(lambda args: mcp_edit_bullet(args["filename"], args["old_text"], args["new_text"], args.get("source")), "filename", "write"),
+    "set_importance": _d(lambda args: mcp_set_importance(args["filename"], args["bullet_text"], args["importance"]), "filename", "write"),
     "delete_bullet": _d(lambda args: mcp_delete_bullet(args["filename"], args["old_text"]), "filename", "write"),
     "delete_section": _d(lambda args: mcp_delete_section(args["filename"], args["section"]), "filename", "write"),
 }

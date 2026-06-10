@@ -436,17 +436,15 @@ canvas { display: block; position: fixed; top: 0; left: 0; width: 100%; height: 
 }
 .re-grip:hover { color: rgba(0,0,0,0.3); }
 
-.re-tier {
-  display: inline-flex; align-items: center; justify-content: center;
-  width: 16px; height: 16px; border-radius: 3px;
-  font-size: 8px; font-weight: 500; letter-spacing: 0;
-  flex-shrink: 0; cursor: pointer; transition: all 100ms;
-  margin-right: 2px; user-select: none;
+.re-imp {
+  display: inline-flex; align-items: center; gap: 2px;
+  flex-shrink: 0; cursor: pointer; margin-right: 4px; user-select: none;
 }
-.re-tier-core { background: rgba(180,140,50,0.12); color: rgba(160,120,30,0.7); }
-.re-tier-active { background: rgba(60,120,200,0.1); color: rgba(50,100,180,0.6); }
-.re-tier-ref { background: rgba(0,0,0,0.05); color: rgba(0,0,0,0.3); }
-.re-tier-temp { background: rgba(160,60,180,0.08); color: rgba(140,50,160,0.5); }
+.re-pip { width: 6px; height: 6px; border-radius: 50%; background: rgba(0,0,0,0.14); transition: background 100ms; }
+.re-pip:hover { background: rgba(60,120,200,0.4); }
+.re-pip-on { background: rgba(60,120,200,0.8); }
+body.dark .re-pip { background: rgba(255,255,255,0.16); }
+body.dark .re-pip-on { background: rgba(95,150,235,0.9); }
 
 .re-source {
   display: inline-flex; align-items: center; justify-content: center;
@@ -1061,21 +1059,24 @@ function parseTs(text) {
 
 function parseMeta(text) {
   var m = text.match(/\{\{([^}]+)\}\}/);
-  if (!m) return { text: text.trim(), created: null, reviewed: null, tier: 'active', tags: [], expiry: null, source: null };
+  if (!m) return { text: text.trim(), created: null, reviewed: null, importance: 3, tags: [], expiry: null, source: null, rec: null };
   var clean = text.substring(0, m.index).trimEnd();
   var parts = m[1].split('|');
   var created = parts[0] || null;
-  var reviewed = null, tier = 'active', tags = [], expiry = null, source = null, rec = null;
+  var reviewed = null, importance = null, legacyTier = null, tags = [], expiry = null, source = null, rec = null;
   for (var i = 1; i < parts.length; i++) {
     var p = parts[i];
     if (p.indexOf('rec:') === 0) rec = p.substring(4);
     else if (p.indexOf('r:') === 0) reviewed = p.substring(2);
-    else if (p.indexOf('t:') === 0) tier = p.substring(2);
+    else if (p.indexOf('i:') === 0) importance = parseInt(p.substring(2), 10);
+    else if (p.indexOf('t:') === 0) legacyTier = p.substring(2);
     else if (p.indexOf('#') === 0) tags = p.substring(1).split(',').filter(Boolean);
     else if (p.indexOf('x:') === 0) expiry = p.substring(2);
     else if (p.indexOf('s:') === 0) source = p.substring(2);
   }
-  return { text: clean, created: created, reviewed: reviewed, tier: tier, tags: tags, expiry: expiry, source: source, rec: rec };
+  if (importance === null || isNaN(importance)) importance = ({ core: 5, active: 3, ref: 2, temp: 1 })[legacyTier] || 3;
+  importance = Math.max(1, Math.min(5, importance));
+  return { text: clean, created: created, reviewed: reviewed, importance: importance, tags: tags, expiry: expiry, source: source, rec: rec };
 }
 
 function stripTs(text) { return text.replace(/\s*\{\{[^}]*\}\}/, "").trim(); }
@@ -1116,10 +1117,10 @@ function parseMd(content) {
       items.push({ type: "section", text: trimmed.slice(3) });
     } else if (raw.startsWith("  - ") || raw.startsWith("\t- ")) {
       var p = parseMeta(trimmed.slice(2));
-      items.push({ type: "bullet", text: p.text, created: p.created, reviewed: p.reviewed, tier: p.tier, tags: p.tags, expiry: p.expiry, source: p.source, rec: p.rec, indent: 1 });
+      items.push({ type: "bullet", text: p.text, created: p.created, reviewed: p.reviewed, importance: p.importance, tags: p.tags, expiry: p.expiry, source: p.source, rec: p.rec, indent: 1 });
     } else if (trimmed.startsWith("- ")) {
       var p = parseMeta(trimmed.slice(2));
-      items.push({ type: "bullet", text: p.text, created: p.created, reviewed: p.reviewed, tier: p.tier, tags: p.tags, expiry: p.expiry, source: p.source, rec: p.rec, indent: 0 });
+      items.push({ type: "bullet", text: p.text, created: p.created, reviewed: p.reviewed, importance: p.importance, tags: p.tags, expiry: p.expiry, source: p.source, rec: p.rec, indent: 0 });
     }
   }
   return items;
@@ -1138,7 +1139,7 @@ function toMd(items) {
       if (it.created) {
         meta = " {{" + it.created;
         if (it.reviewed) meta += "|r:" + it.reviewed;
-        if (it.tier && it.tier !== "active") meta += "|t:" + it.tier;
+        meta += "|i:" + (it.importance || 3);
         if (it.source) meta += "|s:" + it.source;
         if (it.tags && it.tags.length) meta += "|#" + it.tags.join(",");
         if (it.expiry) meta += "|x:" + it.expiry;
@@ -1171,7 +1172,7 @@ function renderRichEditor(container, items) {
         addBtn.textContent = "+";
         addBtn.title = "add bullet";
         addBtn.addEventListener("click", function() {
-          var newItem = { type: "bullet", text: "", created: todayStr(), reviewed: null, tier: "active", tags: [], expiry: null, source: "manual", indent: 0 };
+          var newItem = { type: "bullet", text: "", created: todayStr(), reviewed: null, importance: 3, tags: [], expiry: null, source: "manual", indent: 0 };
           var insertAt = idx + 1;
           while (insertAt < items.length && items[insertAt].type === "bullet") insertAt++;
           items.splice(insertAt, 0, newItem);
@@ -1221,19 +1222,21 @@ function renderRichEditor(container, items) {
         grip.className = "re-grip";
         grip.textContent = "\u2847";
 
-        var tierBadge = document.createElement("span");
-        var tierName = it.tier || "active";
-        tierBadge.className = "re-tier re-tier-" + tierName;
-        tierBadge.textContent = tierName[0].toUpperCase();
-        tierBadge.title = tierName;
-        tierBadge.addEventListener("click", (function(idx_c) {
-          return function() {
-            var tiers = ['core', 'active', 'ref', 'temp'];
-            var cur = tiers.indexOf(items[idx_c].tier || 'active');
-            items[idx_c].tier = tiers[(cur + 1) % tiers.length];
-            renderRichEditor(container, items);
-          };
-        })(idx));
+        var impWrap = document.createElement("span");
+        impWrap.className = "re-imp";
+        impWrap.title = "importance — click a pip to set 1-5";
+        var curImp = it.importance || 3;
+        for (var pip = 1; pip <= 5; pip++) {
+          (function(level, idx_c) {
+            var dot = document.createElement("span");
+            dot.className = "re-pip" + (level <= curImp ? " re-pip-on" : "");
+            dot.addEventListener("click", function() {
+              items[idx_c].importance = level;
+              renderRichEditor(container, items);
+            });
+            impWrap.appendChild(dot);
+          })(pip, idx);
+        }
 
         var srcBadge = null;
         if (it.source) {
@@ -1267,7 +1270,7 @@ function renderRichEditor(container, items) {
         textEl.addEventListener("keydown", function(e) {
           if (e.key === "Enter") {
             e.preventDefault();
-            var newItem = { type: "bullet", text: "", created: todayStr(), reviewed: null, tier: it.tier || "active", tags: [], expiry: null, source: "manual", rec: null, indent: it.indent };
+            var newItem = { type: "bullet", text: "", created: todayStr(), reviewed: null, importance: it.importance || 3, tags: [], expiry: null, source: "manual", rec: null, indent: it.indent };
             items.splice(idx + 1, 0, newItem);
             renderRichEditor(container, items);
             var all = container.querySelectorAll(".re-item");
@@ -1313,11 +1316,12 @@ function renderRichEditor(container, items) {
 
         actions.appendChild(indBtn);
         actions.appendChild(delBtn);
+        if (it.indent) row.style.marginLeft = "20px";
         row.appendChild(grip);
-        row.appendChild(tierBadge);
+        row.appendChild(impWrap);
         if (srcBadge) row.appendChild(srcBadge);
         if (recBadge) row.appendChild(recBadge);
-        if (staleDays >= 150 && (it.tier === "active" || !it.tier)) {
+        if (staleDays >= 150 && (it.importance || 3) <= 3) {
           var staleBadge = document.createElement("span");
           staleBadge.className = "re-stale";
           staleBadge.textContent = "!";
@@ -1336,7 +1340,7 @@ function renderRichEditor(container, items) {
     addBtn.className = "re-add-btn";
     addBtn.textContent = "+ add bullet";
     addBtn.addEventListener("click", function() {
-      items.push({ type: "bullet", text: "", created: todayStr(), reviewed: null, tier: "active", tags: [], expiry: null, source: "manual", indent: 0 });
+      items.push({ type: "bullet", text: "", created: todayStr(), reviewed: null, importance: 3, tags: [], expiry: null, source: "manual", indent: 0 });
       renderRichEditor(container, items);
       var all = container.querySelectorAll(".re-text");
       if (all.length) all[all.length - 1].focus();
@@ -1349,7 +1353,7 @@ function renderRichEditor(container, items) {
   addSecBtn.textContent = "+ add section";
   addSecBtn.addEventListener("click", function() {
     items.push({ type: "section", text: "" });
-    items.push({ type: "bullet", text: "", created: todayStr(), reviewed: null, tier: "active", tags: [], expiry: null, source: "manual", indent: 0 });
+    items.push({ type: "bullet", text: "", created: todayStr(), reviewed: null, importance: 3, tags: [], expiry: null, source: "manual", indent: 0 });
     renderRichEditor(container, items);
     var allSec = container.querySelectorAll(".re-section-text");
     if (allSec.length) allSec[allSec.length - 1].focus();
@@ -1397,11 +1401,12 @@ function extractKeywords(text) {
   return kw;
 }
 
-var TIER_STYLE = {
-  core:   { baseR: 3.0, baseAlpha: 0.55, glow: true },
-  active: { baseR: 2.0, baseAlpha: 0.40, glow: false },
-  ref:    { baseR: 1.5, baseAlpha: 0.28, glow: false },
-  temp:   { baseR: 1.2, baseAlpha: 0.18, glow: false }
+var IMP_STYLE = {
+  5: { baseR: 3.2, baseAlpha: 0.62, glow: true },
+  4: { baseR: 2.6, baseAlpha: 0.48, glow: true },
+  3: { baseR: 2.0, baseAlpha: 0.38, glow: false },
+  2: { baseR: 1.5, baseAlpha: 0.26, glow: false },
+  1: { baseR: 1.1, baseAlpha: 0.16, glow: false }
 };
 
 var CELL = 80;
@@ -1472,11 +1477,11 @@ function buildGraph(data) {
     for (var n = 0; n < files[f].nodes.length; n++) {
       var nd = files[f].nodes[n];
       var nodeText = (typeof nd === "string") ? nd : nd.text;
-      var nodeTier = (typeof nd === "object" && nd.tier) ? nd.tier : "active";
+      var nodeImportance = (typeof nd === "object" && nd.importance) ? nd.importance : 3;
       var nodeTags = (typeof nd === "object" && nd.tags) ? nd.tags : [];
       var nodeCreated = (typeof nd === "object" && nd.created) ? nd.created : null;
       var nodeSource = (typeof nd === "object" && nd.source) ? nd.source : "manual";
-      var ts = TIER_STYLE[nodeTier] || TIER_STYLE.active;
+      var ts = IMP_STYLE[nodeImportance] || IMP_STYLE[3];
 
       var nx = cx + gaussClamped() * sx;
       var ny = cy + gaussClamped() * sy;
@@ -1487,7 +1492,7 @@ function buildGraph(data) {
         x: nx, y: ny, bx: nx, by: ny, vx: 0, vy: 0,
         r: ts.baseR + Math.random() * 0.8,
         text: nodeText,
-        tier: nodeTier,
+        importance: nodeImportance,
         tags: nodeTags,
         created: nodeCreated,
         source: nodeSource,
@@ -1985,7 +1990,10 @@ cv.addEventListener("mousemove", function(e) {
   hoverNode = hit;
 
   if (hit >= 0) {
-    var tierTag = nodes[hit].tier ? ' <span style="opacity:0.4;font-size:8px;letter-spacing:0.05em;">' + nodes[hit].tier + '</span>' : '';
+    var imp = nodes[hit].importance || 3;
+    var tierTag = ' <span style="font-size:9px;letter-spacing:1px;margin-left:4px;">';
+    for (var pi = 1; pi <= 5; pi++) tierTag += '<span style="opacity:' + (pi <= imp ? 0.8 : 0.18) + ';">●</span>';
+    tierTag += '</span>';
     var srcTag = '';
     if (nodes[hit].source) {
       var sc = nodes[hit].source;
@@ -3003,8 +3011,8 @@ document.getElementById("cleanupBtn").addEventListener("click", function() {
             var items = parseMd(d.content);
             for (var j = 0; j < items.length; j++) {
               if (items[j].type !== "bullet") continue;
-              var tier = items[j].tier || "active";
-              if (tier !== "active") continue;
+              var imp = items[j].importance || 3;
+              if (imp >= 4) continue;
               var staleDate = items[j].reviewed || items[j].created;
               var sd = daysSince(staleDate);
               if (sd >= 90) {
@@ -3090,11 +3098,11 @@ function generatePdf() {
       doc.text(lines, margin + 10, y);
       y += lines.length * lineH;
 
-      if (node.tier || node.created) {
+      if (node.importance || node.created) {
         doc.setFontSize(7.5);
         doc.setTextColor(150, 150, 150);
         var meta = [];
-        if (node.tier && node.tier !== "active") meta.push(node.tier);
+        if (node.importance && node.importance !== 3) meta.push("i" + node.importance);
         if (node.source && node.source !== "manual") meta.push(node.source);
         if (node.created) meta.push(node.created);
         if (meta.length) {
@@ -3169,7 +3177,7 @@ function buildTimeline() {
     for (var j = 0; j < f.nodes.length; j++) {
       var nd = f.nodes[j];
       var entry = {
-        text: nd.text || nd, tier: nd.tier || "active",
+        text: nd.text || nd, importance: nd.importance || 3,
         created: nd.created || null, source: nd.source || "manual",
         file: f.name, color: f.color || null
       };
@@ -3243,12 +3251,12 @@ function buildTimeline() {
 
         dots.push({
           x: s.x + jitterX, y: y,
-          r: s.node.tier === "core" ? dotR * 1.3 : s.node.tier === "ref" ? dotR * 0.7 : dotR,
+          r: (s.node.importance >= 5) ? dotR * 1.3 : (s.node.importance <= 2) ? dotR * 0.7 : dotR,
           color: s.node.color,
-          alpha: s.node.tier === "core" ? 0.7 : s.node.tier === "ref" ? 0.3 : 0.5,
+          alpha: (s.node.importance >= 5) ? 0.7 : (s.node.importance <= 2) ? 0.3 : 0.5,
           text: s.node.text, file: s.node.file,
           date: s.node.created, source: s.node.source,
-          tier: s.node.tier, cluster: ci
+          importance: s.node.importance, cluster: ci
         });
       }
     }
@@ -3457,7 +3465,7 @@ function bindTimelineMouse() {
       var fg = isDark ? "255,255,255" : "0,0,0";
       var srcColor = (dot.source === 'claude' || dot.source === 'claude_code') ? 'rgba(204,108,29,0.7)' : dot.source === 'perplexity' ? 'rgba(120,80,200,0.7)' : 'rgba(' + fg + ',0.35)';
 
-      var h = '<div class="tl-tt-file">' + dot.file + (dot.tier ? ' <span style="opacity:0.5;font-size:8px;">' + dot.tier + '</span>' : '') + '</div>';
+      var h = '<div class="tl-tt-file">' + dot.file + (dot.importance ? ' <span style="opacity:0.5;font-size:8px;">i' + dot.importance + '</span>' : '') + '</div>';
       h += dot.text;
       if (dot.date) h += '<div class="tl-tt-date">' + dot.date + ' — ' + relDate(dot.date) + ' ago</div>';
       else h += '<div class="tl-tt-date">undated</div>';

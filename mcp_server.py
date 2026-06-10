@@ -53,6 +53,14 @@ def emit_activity(cluster, action="read", source=""):
     except Exception:
         pass
 
+def _clamp_imp(v):
+    try:
+        n = int(v)
+    except (TypeError, ValueError):
+        return 3
+    return 1 if n < 1 else 5 if n > 5 else n
+
+
 STOP_WORDS = {
     "the", "a", "an", "is", "are", "was", "were", "in", "on", "at", "to", "for",
     "of", "with", "and", "or", "but", "not", "this", "that", "it", "be", "has",
@@ -149,7 +157,8 @@ mcp = FastMCP(
         "1. READ: Call get_context_for_topic or search_brain. On first message, call get_brain_summary. Always read before responding.\n"
         "2. SAVE: Actively look for facts to save. Default is to save — only skip if the message is a pure generic question with zero personal context. "
         "But ONLY save facts you are confident are accurate. If the user's message is ambiguous, or you're unsure you understood correctly, ask before saving. "
-        "Never save guesses, vague impressions, or unverified claims. Bad data in Cortex is worse than missing data.\n"
+        "Never save guesses, vague impressions, or unverified claims. Bad data in Cortex is worse than missing data. "
+        "Every memory you save MUST include an importance 1-5 — save freely and rank honestly rather than withholding info.\n"
         "3. REPORT: End every response with [Cortex: ...] — what you read, what you saved/edited, or why you skipped.\n\n"
 
         "=== ACCURACY GUARD ===\n\n"
@@ -164,7 +173,8 @@ mcp = FastMCP(
 
         "=== SOURCES ===\n\n"
         "Always set source: 'claude' (Desktop), 'claude_code', or 'perplexity'. "
-        "Tiers: core (identity), active (current), ref (past), temp (ephemeral+expiry).\n\n"
+        "Importance 1-5 on every memory: 5=life-defining identity/values/major goals, 4=major projects/key relationships/hard commitments, 3=normal useful fact, 2=minor/secondary detail, 1=trivial or short-lived. "
+        "Use expiry (YYYY-MM-DD) only for genuinely time-bound facts. For a fact that continues another bullet, pass parent= to nest it as a sub-bullet instead of a dangling sibling.\n\n"
 
         "=== CLIENT DEFAULTS ===\n\n"
         "Claude Code: scope=build, auto-save build logs. Perplexity: scope=strategy. Claude Desktop: full access, no default scope."
@@ -315,35 +325,43 @@ def _insert_under_section(content, section, bullet):
 
 
 @mcp.tool()
-def save_to_brain(filename: str, bullet: str, section: str = "", tier: str = "active", expiry: str = "", source: str = "", rec: str = "") -> str:
-    """Save a memory to a brain cluster under a specific section.
+def save_to_brain(filename: str, bullet: str, importance: int = 3, section: str = "", expiry: str = "", source: str = "", rec: str = "", parent: str = "") -> str:
+    """Save a memory to a brain cluster.
 
-    BEFORE CALLING THIS: You MUST call get_cluster on the target file first.
-    Read its sections, confirm the section exists, check for duplicates.
-    If a bullet about this topic already exists, use edit_bullet instead.
+    BEFORE CALLING THIS: call get_cluster on the target file first — confirm the
+    section exists and check for duplicates. If a bullet about this topic already
+    exists, use edit_bullet instead.
 
     RULES:
-    - ALWAYS pass the section parameter (exact ## header name). Without it, bullets land in the wrong place.
-    - Each bullet = one atomic fact. Specific: dates, names, outcomes. No filler.
+    - importance (1-5) is REQUIRED — rank honestly: 5 = life-defining identity / values /
+      major goals, 4 = major projects / key relationships / hard commitments, 3 = normal
+      useful fact, 2 = minor or secondary detail, 1 = trivial or short-lived. Save freely;
+      do not skip useful info — just rank it.
+    - Pass the section parameter (exact ## header name).
+    - One complete thought per bullet. If a fact directly continues or extends another
+      bullet, pass 'parent' (a unique substring of that bullet) to nest this as a
+      sub-bullet, instead of creating a dangling separate bullet.
     - Source is REQUIRED: 'claude', 'claude_code', 'perplexity', or 'manual'.
-    - Tiers: core (identity), active (current work), ref (past), temp (ephemeral + expiry).
+    - expiry (YYYY-MM-DD): only for genuinely time-bound facts — they auto-delete after.
     - rec: 'pending' for AI recommendations. Leave empty for confirmed facts.
-    - If no section fits, pass a new section name — it will be created.
     - If no cluster fits, use create_cluster instead."""
     if not filename.endswith(".md"):
         filename += ".md"
-    if not bullet.startswith("- "):
-        bullet = "- " + bullet
-    if tier not in ("core", "active", "ref", "temp"):
-        tier = "active"
-    if tier != "temp":
-        expiry = ""
+    bullet = bullet.strip()
+    if bullet.startswith("- "):
+        bullet = bullet[2:].strip()
+    importance = _clamp_imp(importance)
     if not source:
         source = "mcp"
     if rec and rec not in ("pending", "confirmed"):
         rec = ""
-    if not re.search(r"\{\{\d{4}-\d{2}-\d{2}", bullet):
-        meta = "{{" + date.today().isoformat() + "|t:" + tier
+    doc = aw_find(filename)
+    if not doc:
+        available = [d["filename"] for d in aw_list()]
+        return f"'{filename}' not found. Available: {', '.join(available)}"
+
+    def _stamp(prefix):
+        meta = "{{" + date.today().isoformat() + "|i:" + str(importance)
         if source:
             meta += "|s:" + source
         if expiry:
@@ -351,22 +369,38 @@ def save_to_brain(filename: str, bullet: str, section: str = "", tier: str = "ac
         if rec:
             meta += "|rec:" + rec
         meta += "}}"
-        bullet = bullet.rstrip() + " " + meta
-    doc = aw_find(filename)
-    if not doc:
-        available = [d["filename"] for d in aw_list()]
-        return f"'{filename}' not found. Available: {', '.join(available)}"
+        return prefix + bullet + " " + meta
+
+    lines = doc["content"].split("\n")
+    if parent:
+        pidx = -1
+        for i, line in enumerate(lines):
+            if line.strip().startswith("- ") and parent.strip() in line:
+                pidx = i
+                break
+        if pidx == -1:
+            return f"parent bullet matching '{parent}' not found in {filename}"
+        child = _stamp("  - ")
+        ins = pidx + 1
+        while ins < len(lines) and lines[ins].startswith("  - "):
+            ins += 1
+        lines.insert(ins, child)
+        db_update(doc["$id"], "\n".join(lines))
+        emit_activity(filename, "write", source)
+        return f"saved under '{parent.strip()}' in {filename}: {child.strip()}"
+
+    stamped = _stamp("- ")
     content = doc["content"]
     if section:
-        content = _insert_under_section(content, section, bullet)
+        content = _insert_under_section(content, section, stamped)
     else:
         if not content.endswith("\n"):
             content += "\n"
-        content += bullet + "\n"
+        content += stamped + "\n"
     db_update(doc["$id"], content)
     target = f"{filename} > {section}" if section else filename
     emit_activity(filename, "write", source)
-    return f"saved to {target}: {bullet}"
+    return f"saved to {target}: {stamped}"
 
 
 @mcp.tool()
@@ -390,7 +424,7 @@ def create_cluster(filename: str, content: str, source: str = "", scope: str = "
     for line in lines:
         stripped = line.strip()
         if stripped.startswith("- ") and not re.search(r"\{\{\d{4}-\d{2}-\d{2}", stripped):
-            meta = "{{" + date.today().isoformat() + "|t:active|s:" + source + "}}"
+            meta = "{{" + date.today().isoformat() + "|i:3|s:" + source + "}}"
             stamped.append(stripped.rstrip() + " " + meta)
         else:
             stamped.append(line)
@@ -423,18 +457,56 @@ def edit_bullet(filename: str, old_text: str, new_text: str, source: str = "") -
             break
     if match_idx == -1:
         return f"no bullet matching '{old_text}' found in {filename}"
+    old_line = lines[match_idx]
+    indent = "  " if (old_line.startswith("  - ") or old_line.startswith("\t- ")) else ""
+    mi = re.search(r"\|i:(\d)", old_line)
+    if mi:
+        old_imp = _clamp_imp(mi.group(1))
+    else:
+        mt = re.search(r"\|t:(\w+)", old_line)
+        old_imp = {"core": 5, "active": 3, "ref": 2, "temp": 1}.get(mt.group(1) if mt else "", 3)
     if not new_text.startswith("- "):
         new_text = "- " + new_text
     if not source:
         source = "mcp"
     if not re.search(r"\{\{\d{4}-\d{2}-\d{2}", new_text):
-        meta = "{{" + date.today().isoformat() + "|t:active|s:" + source + "}}"
+        meta = "{{" + date.today().isoformat() + "|i:" + str(old_imp) + "|s:" + source + "}}"
         new_text = new_text.rstrip() + " " + meta
-    lines[match_idx] = new_text
+    lines[match_idx] = indent + new_text
     content = "\n".join(lines)
     db_update(doc["$id"], content)
     emit_activity(filename, "write", source)
     return f"edited in {filename}: '{old_text.strip()}' → '{new_text.strip()}'"
+
+
+@mcp.tool()
+def set_importance(filename: str, bullet_text: str, importance: int) -> str:
+    """Update the 1-5 importance ranking of an existing memory bullet.
+    Use when re-evaluating how much a memory matters (5 = life-defining, 1 = trivial).
+    bullet_text: a unique substring of the bullet to re-rank."""
+    if not filename.endswith(".md"):
+        filename += ".md"
+    importance = _clamp_imp(importance)
+    doc = aw_find(filename)
+    if not doc:
+        available = [d["filename"] for d in aw_list()]
+        return f"'{filename}' not found. Available: {', '.join(available)}"
+    lines = doc["content"].split("\n")
+    for i, line in enumerate(lines):
+        if line.strip().startswith("- ") and bullet_text.strip() in line:
+            if "{{" not in line:
+                lines[i] = line.rstrip() + " {{" + date.today().isoformat() + "|i:" + str(importance) + "}}"
+            else:
+                line = re.sub(r"\|t:\w+", "", line)
+                if re.search(r"\|i:\d", line):
+                    line = re.sub(r"\|i:\d+", "|i:" + str(importance), line)
+                else:
+                    line = re.sub(r"(\{\{\d{4}-\d{2}-\d{2})", r"\1|i:" + str(importance), line, count=1)
+                lines[i] = line
+            db_update(doc["$id"], "\n".join(lines))
+            emit_activity(filename, "write")
+            return f"set importance {importance} on: {bullet_text.strip()}"
+    return f"no bullet matching '{bullet_text}' in {filename}"
 
 
 @mcp.tool()
@@ -587,13 +659,19 @@ def lint_brain() -> str:
             issues.append(f"NO METADATA: {b['file']} > {b['text'][:60]}")
             continue
         m = meta.group(1)
-        if "|t:active" in m:
+        mi = re.search(r"\|i:(\d)", m)
+        if mi:
+            imp = int(mi.group(1))
+        else:
+            mt = re.search(r"\|t:(\w+)", m)
+            imp = {"core": 5, "active": 3, "ref": 2, "temp": 1}.get(mt.group(1) if mt else "", 3)
+        if imp <= 3:
             date_match = re.match(r'(\d{4}-\d{2}-\d{2})', m)
             if date_match:
                 try:
                     d = date.fromisoformat(date_match.group(1))
                     if (date.today() - d).days > 90:
-                        issues.append(f"STALE (>90d): {b['file']} > {b['text'][:60]}")
+                        issues.append(f"STALE (>90d, i{imp}): {b['file']} > {b['text'][:60]}")
                 except ValueError:
                     pass
     seen = []
