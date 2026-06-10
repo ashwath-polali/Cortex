@@ -1402,12 +1402,13 @@ function extractKeywords(text) {
 }
 
 var IMP_STYLE = {
-  5: { baseR: 3.2, baseAlpha: 0.62, glow: true },
-  4: { baseR: 2.6, baseAlpha: 0.48, glow: true },
+  5: { baseR: 2.8, baseAlpha: 0.60, glow: true },
+  4: { baseR: 2.4, baseAlpha: 0.48, glow: true },
   3: { baseR: 2.0, baseAlpha: 0.38, glow: false },
-  2: { baseR: 1.5, baseAlpha: 0.26, glow: false },
-  1: { baseR: 1.1, baseAlpha: 0.16, glow: false }
+  2: { baseR: 1.7, baseAlpha: 0.28, glow: false },
+  1: { baseR: 1.45, baseAlpha: 0.20, glow: false }
 };
+var nodeDrawOrder = null;
 
 var CELL = 80;
 var EDGE_DIST = 140;
@@ -1851,7 +1852,12 @@ function frame(ts) {
     if (edges[ri]) edges[ri].live = true;
   }
 
-  for (var i = 0; i < nodes.length; i++) {
+  if (!nodeDrawOrder || nodeDrawOrder.length !== nodes.length) {
+    nodeDrawOrder = nodes.map(function(_, idx) { return idx; });
+    nodeDrawOrder.sort(function(a, b) { return nodes[b].r - nodes[a].r; });
+  }
+  for (var k = 0; k < nodeDrawOrder.length; k++) {
+    var i = nodeDrawOrder[k];
     var n = nodes[i];
     var isHot = i === hoverNode || i === activeNode;
 
