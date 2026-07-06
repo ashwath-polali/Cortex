@@ -26,7 +26,7 @@ CORTEX_PASSWORD = os.getenv("CORTEX_PASSWORD", "")
 CORTEX_MCP_KEY = os.getenv("CORTEX_MCP_KEY", "")
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
-from db import db_list, db_find, db_create, db_update, db_delete
+from db import db_list, db_create, db_update, db_delete, db_log_activity, db_get_activity
 
 def aw_list():
     return {"documents": db_list()}
@@ -164,7 +164,7 @@ def clamp_importance(v):
 def parse_meta(text):
     m = re.search(r'\{\{([^}]+)\}\}', text)
     if not m:
-        return {'text': text.strip(), 'created': None, 'reviewed': None, 'importance': 3, 'tags': [], 'expiry': None, 'source': None, 'rec': None}
+        return {'text': text.strip(), 'created': None, 'reviewed': None, 'importance': 3, 'tags': [], 'expiry': None, 'source': None, 'rec': None, 'link': None, 'id': None}
     clean = text[:m.start()].rstrip()
     parts = m.group(1).split('|')
     created = parts[0] if parts else None
@@ -175,6 +175,8 @@ def parse_meta(text):
     expiry = None
     source = None
     rec = None
+    link = None
+    bid = None
     for p in parts[1:]:
         if p.startswith('r:'):
             reviewed = p[2:]
@@ -190,9 +192,13 @@ def parse_meta(text):
             source = p[2:]
         elif p.startswith('rec:'):
             rec = p[4:]
+        elif p.startswith('ln:'):
+            link = p[3:]
+        elif p.startswith('id:'):
+            bid = p[3:]
     if importance is None:
         importance = LEGACY_TIER_IMP.get(legacy_tier, 3)
-    return {'text': clean, 'created': created, 'reviewed': reviewed, 'importance': importance, 'tags': tags, 'expiry': expiry, 'source': source, 'rec': rec}
+    return {'text': clean, 'created': created, 'reviewed': reviewed, 'importance': importance, 'tags': tags, 'expiry': expiry, 'source': source, 'rec': rec, 'link': link, 'id': bid}
 
 
 def stamp_bullet(line, importance=3, expiry=None, source=None, rec=None):
@@ -398,6 +404,7 @@ def brain():
                 meta = parse_meta(stripped[2:])
                 if meta["expiry"] and meta["expiry"] < today_str:
                     continue
+                indent = (len(line) - len(line.lstrip(" "))) // 2
                 nodes.append({
                     "text": meta["text"],
                     "importance": meta["importance"],
@@ -406,6 +413,9 @@ def brain():
                     "tags": meta["tags"],
                     "source": meta["source"] or "manual",
                     "rec": meta.get("rec"),
+                    "indent": indent,
+                    "link": meta.get("link"),
+                    "id": meta.get("id"),
                 })
         files.append({"name": doc["filename"].replace(".md", ""), "nodes": nodes, "color": color, "scope": scope})
     return jsonify({"files": files})
@@ -1124,25 +1134,11 @@ MCP_DISPATCH = {
 
 
 
-def _aw_activity_doc():
-    try:
-        return db_find("__activity__")
-    except Exception:
-        return None
-
 def _track(cluster, action="read", source=""):
     if not cluster:
         return
     try:
-        event = json.dumps({"cluster": cluster, "action": action, "source": source, "ts": time.time()})
-        doc = _aw_activity_doc()
-        if doc:
-            old = doc["content"].strip().split("\n") if doc["content"].strip() else []
-            old.append(event)
-            old = old[-30:]
-            db_update(doc["$id"], "\n".join(old))
-        else:
-            db_create("__activity__", event)
+        db_log_activity({"cluster": cluster, "action": action, "source": source, "ts": time.time()})
     except Exception:
         pass
 
@@ -1156,19 +1152,12 @@ def post_activity():
 def get_activity():
     if not session.get("authenticated"):
         return jsonify([])
-    doc = _aw_activity_doc()
-    if not doc or not doc["content"].strip():
+    try:
+        events = db_get_activity()
+    except Exception:
         return jsonify([])
     cutoff = time.time() - 30
-    events = []
-    for line in doc["content"].strip().split("\n"):
-        try:
-            e = json.loads(line)
-            if e.get("ts", 0) > cutoff:
-                events.append(e)
-        except Exception:
-            continue
-    return jsonify(events)
+    return jsonify([e for e in events if e.get("ts", 0) > cutoff])
 
 
 _seeded = False

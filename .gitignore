@@ -1,6 +1,13 @@
 brain/*
 !brain/.gitkeep
 !brain/README.md
+brain_backup_*/
+brain_export_*/
+digest_*.txt
+digest_brain.py
+backup_brain.py
+reorg_phase2.py
+reorg_finish.py
 .env
 *.env
 __pycache__/
@@ -9,3 +16,4 @@ __pycache__/
 .claude/
 .vercel/
 CLAUDE.md
+backfill_ids.py

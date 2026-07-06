@@ -1059,14 +1059,16 @@ function parseTs(text) {
 
 function parseMeta(text) {
   var m = text.match(/\{\{([^}]+)\}\}/);
-  if (!m) return { text: text.trim(), created: null, reviewed: null, importance: 3, tags: [], expiry: null, source: null, rec: null };
+  if (!m) return { text: text.trim(), created: null, reviewed: null, importance: 3, tags: [], expiry: null, source: null, rec: null, link: null, id: null };
   var clean = text.substring(0, m.index).trimEnd();
   var parts = m[1].split('|');
   var created = parts[0] || null;
-  var reviewed = null, importance = null, legacyTier = null, tags = [], expiry = null, source = null, rec = null;
+  var reviewed = null, importance = null, legacyTier = null, tags = [], expiry = null, source = null, rec = null, link = null, bid = null;
   for (var i = 1; i < parts.length; i++) {
     var p = parts[i];
     if (p.indexOf('rec:') === 0) rec = p.substring(4);
+    else if (p.indexOf('ln:') === 0) link = p.substring(3);
+    else if (p.indexOf('id:') === 0) bid = p.substring(3);
     else if (p.indexOf('r:') === 0) reviewed = p.substring(2);
     else if (p.indexOf('i:') === 0) importance = parseInt(p.substring(2), 10);
     else if (p.indexOf('t:') === 0) legacyTier = p.substring(2);
@@ -1076,7 +1078,7 @@ function parseMeta(text) {
   }
   if (importance === null || isNaN(importance)) importance = ({ core: 5, active: 3, ref: 2, temp: 1 })[legacyTier] || 3;
   importance = Math.max(1, Math.min(5, importance));
-  return { text: clean, created: created, reviewed: reviewed, importance: importance, tags: tags, expiry: expiry, source: source, rec: rec };
+  return { text: clean, created: created, reviewed: reviewed, importance: importance, tags: tags, expiry: expiry, source: source, rec: rec, link: link, id: bid };
 }
 
 function stripTs(text) { return text.replace(/\s*\{\{[^}]*\}\}/, "").trim(); }
@@ -1115,12 +1117,11 @@ function parseMd(content) {
     if (trimmed.startsWith("<!-- color:")) continue;
     if (trimmed.startsWith("## ")) {
       items.push({ type: "section", text: trimmed.slice(3) });
-    } else if (raw.startsWith("  - ") || raw.startsWith("\t- ")) {
-      var p = parseMeta(trimmed.slice(2));
-      items.push({ type: "bullet", text: p.text, created: p.created, reviewed: p.reviewed, importance: p.importance, tags: p.tags, expiry: p.expiry, source: p.source, rec: p.rec, indent: 1 });
     } else if (trimmed.startsWith("- ")) {
+      var lead = raw.match(/^[ \t]*/)[0].replace(/\t/g, "  ");
+      var depth = Math.min(4, Math.floor(lead.length / 2));
       var p = parseMeta(trimmed.slice(2));
-      items.push({ type: "bullet", text: p.text, created: p.created, reviewed: p.reviewed, importance: p.importance, tags: p.tags, expiry: p.expiry, source: p.source, rec: p.rec, indent: 0 });
+      items.push({ type: "bullet", text: p.text, created: p.created, reviewed: p.reviewed, importance: p.importance, tags: p.tags, expiry: p.expiry, source: p.source, rec: p.rec, link: p.link, id: p.id, indent: depth });
     }
   }
   return items;
@@ -1134,7 +1135,8 @@ function toMd(items) {
       if (lines.length > 0) lines.push("");
       lines.push("## " + it.text);
     } else {
-      var prefix = it.indent ? "  - " : "- ";
+      var depth = typeof it.indent === "number" ? it.indent : (it.indent ? 1 : 0);
+      var prefix = new Array(depth + 1).join("  ") + "- ";
       var meta = "";
       if (it.created) {
         meta = " {{" + it.created;
@@ -1144,6 +1146,8 @@ function toMd(items) {
         if (it.tags && it.tags.length) meta += "|#" + it.tags.join(",");
         if (it.expiry) meta += "|x:" + it.expiry;
         if (it.rec) meta += "|rec:" + it.rec;
+        if (it.link) meta += "|ln:" + it.link;
+        if (it.id) meta += "|id:" + it.id;
         meta += "}}";
       }
       lines.push(prefix + it.text + meta);
@@ -1280,8 +1284,8 @@ function renderRichEditor(container, items) {
           }
           if (e.key === "Tab") {
             e.preventDefault();
-            if (e.shiftKey) { items[idx].indent = 0; }
-            else { items[idx].indent = 1; }
+            var d = typeof it.indent === "number" ? it.indent : (it.indent ? 1 : 0);
+            items[idx].indent = e.shiftKey ? Math.max(0, d - 1) : Math.min(3, d + 1);
             renderRichEditor(container, items);
           }
           if (e.key === "Backspace" && !this.textContent) {
@@ -1297,14 +1301,30 @@ function renderRichEditor(container, items) {
         var actions = document.createElement("span");
         actions.className = "re-actions";
 
-        var indBtn = document.createElement("button");
-        indBtn.className = "re-act";
-        indBtn.textContent = it.indent ? "\u2190" : "\u2192";
-        indBtn.title = it.indent ? "outdent" : "indent";
-        indBtn.addEventListener("click", function() {
-          items[idx].indent = it.indent ? 0 : 1;
-          renderRichEditor(container, items);
-        });
+        var curDepth = typeof it.indent === "number" ? it.indent : (it.indent ? 1 : 0);
+
+        if (curDepth > 0) {
+          var outBtn = document.createElement("button");
+          outBtn.className = "re-act";
+          outBtn.textContent = "\u2190";
+          outBtn.title = "outdent (shift+tab)";
+          outBtn.addEventListener("click", function() {
+            items[idx].indent = Math.max(0, curDepth - 1);
+            renderRichEditor(container, items);
+          });
+          actions.appendChild(outBtn);
+        }
+        if (curDepth < 3) {
+          var inBtn = document.createElement("button");
+          inBtn.className = "re-act";
+          inBtn.textContent = "\u2192";
+          inBtn.title = "indent (tab)";
+          inBtn.addEventListener("click", function() {
+            items[idx].indent = Math.min(3, curDepth + 1);
+            renderRichEditor(container, items);
+          });
+          actions.appendChild(inBtn);
+        }
 
         var delBtn = document.createElement("button");
         delBtn.className = "re-act re-del";
@@ -1314,9 +1334,8 @@ function renderRichEditor(container, items) {
           renderRichEditor(container, items);
         });
 
-        actions.appendChild(indBtn);
         actions.appendChild(delBtn);
-        if (it.indent) row.style.marginLeft = "20px";
+        if (curDepth) row.style.marginLeft = (20 * curDepth) + "px";
         row.appendChild(grip);
         row.appendChild(impWrap);
         if (srcBadge) row.appendChild(srcBadge);
@@ -1447,14 +1466,24 @@ function gaussClamped() {
   return Math.max(-2.2, Math.min(2.2, g));
 }
 
+var hierPairs = [];
+
 function buildGraph(data) {
   nodes = [];
   edges = [];
   clusterMeta = [];
+  hierPairs = [];
 
   var files = data.files;
   var fc = files.length;
   if (!fc) return;
+
+  // one grid cell per cluster (sub-clusters included); files are ordered so
+  // sub-clusters ('projects/wisegraph') land in cells adjacent to their family
+  var order = files.map(function(_, i) { return i; });
+  order.sort(function(a, b) {
+    return files[a].name < files[b].name ? -1 : files[a].name > files[b].name ? 1 : 0;
+  });
 
   var mx = W * 0.10;
   var my = H * 0.10;
@@ -1467,44 +1496,62 @@ function buildGraph(data) {
   var cellH = useH / rows;
   var pad = 15;
 
-  for (var f = 0; f < fc; f++) {
-    var col = f % cols;
-    var row = Math.floor(f / cols);
+  for (var oi = 0; oi < fc; oi++) {
+    var f = order[oi];
+    var col = oi % cols;
+    var row = Math.floor(oi / cols);
     var cx = mx + cellW * (col + 0.5);
     var cy = my + cellH * (row + 0.5);
-    var sx = cellW * 0.30;
-    var sy = cellH * 0.30;
+    var boost = 1 + Math.min(0.35, files[f].nodes.length / 400);
+    var sx = cellW * 0.30 * boost;
+    var sy = cellH * 0.30 * boost;
 
-    for (var n = 0; n < files[f].nodes.length; n++) {
-      var nd = files[f].nodes[n];
-      var nodeText = (typeof nd === "string") ? nd : nd.text;
-      var nodeImportance = (typeof nd === "object" && nd.importance) ? nd.importance : 3;
-      var nodeTags = (typeof nd === "object" && nd.tags) ? nd.tags : [];
-      var nodeCreated = (typeof nd === "object" && nd.created) ? nd.created : null;
-      var nodeSource = (typeof nd === "object" && nd.source) ? nd.source : "manual";
-      var ts = IMP_STYLE[nodeImportance] || IMP_STYLE[3];
+    {
+      var parentAt = [];
+      for (var n = 0; n < files[f].nodes.length; n++) {
+        var nd = files[f].nodes[n];
+        var nodeText = (typeof nd === "string") ? nd : nd.text;
+        var nodeImportance = (typeof nd === "object" && nd.importance) ? nd.importance : 3;
+        var nodeTags = (typeof nd === "object" && nd.tags) ? nd.tags : [];
+        var nodeCreated = (typeof nd === "object" && nd.created) ? nd.created : null;
+        var nodeSource = (typeof nd === "object" && nd.source) ? nd.source : "manual";
+        var nodeIndent = (typeof nd === "object" && nd.indent) ? nd.indent : 0;
+        var nodeLink = (typeof nd === "object" && nd.link) ? nd.link : null;
+        var ts = IMP_STYLE[nodeImportance] || IMP_STYLE[3];
 
-      var nx = cx + gaussClamped() * sx;
-      var ny = cy + gaussClamped() * sy;
-      nx = Math.max(pad, Math.min(W - pad, nx));
-      ny = Math.max(pad, Math.min(H - pad, ny));
+        var idx = nodes.length;
+        if (nodeIndent > 0 && parentAt[nodeIndent - 1] !== undefined) {
+          hierPairs.push([parentAt[nodeIndent - 1], idx]);
+        }
+        parentAt[nodeIndent] = idx;
+        parentAt.length = nodeIndent + 1;
 
-      nodes.push({
-        x: nx, y: ny, bx: nx, by: ny, vx: 0, vy: 0,
-        r: ts.baseR + Math.random() * 0.8,
-        text: nodeText,
-        importance: nodeImportance,
-        tags: nodeTags,
-        created: nodeCreated,
-        source: nodeSource,
-        glow: ts.glow,
-        file: files[f].name,
-        cluster: f,
-        alpha: ts.baseAlpha + Math.random() * 0.15,
-        phase: Math.random() * Math.PI * 2,
-        freq: 0.00012 + Math.random() * 0.0002,
-        drift: 0.4 + Math.random() * 0.8
-      });
+        // diffuse gauss cloud within the cluster's cell — hierarchy is carried
+        // by the parent-child edges, not by clumping nodes together
+        var nx = cx + gaussClamped() * sx;
+        var ny = cy + gaussClamped() * sy;
+        nx = Math.max(pad, Math.min(W - pad, nx));
+        ny = Math.max(pad, Math.min(H - pad, ny));
+
+        nodes.push({
+          x: nx, y: ny, bx: nx, by: ny, vx: 0, vy: 0,
+          r: ts.baseR + Math.random() * 0.8,
+          text: nodeText,
+          importance: nodeImportance,
+          tags: nodeTags,
+          created: nodeCreated,
+          source: nodeSource,
+          indent: nodeIndent,
+          link: nodeLink,
+          glow: ts.glow,
+          file: files[f].name,
+          cluster: f,
+          alpha: ts.baseAlpha + Math.random() * 0.15,
+          phase: Math.random() * Math.PI * 2,
+          freq: 0.00012 + Math.random() * 0.0002,
+          drift: 0.4 + Math.random() * 0.8
+        });
+      }
     }
   }
 
@@ -1560,6 +1607,44 @@ function buildEdges() {
   rebuildGrid();
   var added = {};
 
+  // hierarchy edges: parent memory -> child memory (from bullet indent)
+  for (var h = 0; h < hierPairs.length; h++) {
+    var pa = hierPairs[h][0], pb = hierPairs[h][1];
+    var hlo = Math.min(pa, pb), hhi = Math.max(pa, pb);
+    added[hlo * 100000 + hhi] = true;
+    var hdx = nodes[pa].x - nodes[pb].x, hdy = nodes[pa].y - nodes[pb].y;
+    edges.push({
+      a: pa, b: pb, d: Math.sqrt(hdx * hdx + hdy * hdy),
+      t: Math.random(), speed: 0.00008 + Math.random() * 0.00012,
+      live: Math.random() < 0.06, hier: true
+    });
+  }
+
+  // sibling edges: memories sharing a |ln: link group (dashed, cross-cluster)
+  var linkGroups = {};
+  for (var i = 0; i < nodes.length; i++) {
+    if (nodes[i].link) {
+      if (!linkGroups[nodes[i].link]) linkGroups[nodes[i].link] = [];
+      linkGroups[nodes[i].link].push(i);
+    }
+  }
+  for (var lg in linkGroups) {
+    var grp = linkGroups[lg];
+    for (var k = 0; k + 1 < grp.length; k++) {
+      var slo = Math.min(grp[k], grp[k + 1]), shi = Math.max(grp[k], grp[k + 1]);
+      var skey = slo * 100000 + shi;
+      if (added[skey]) continue;
+      added[skey] = true;
+      var sa = nodes[grp[k]], sb = nodes[grp[k + 1]];
+      var sdx = sa.x - sb.x, sdy = sa.y - sb.y;
+      edges.push({
+        a: grp[k], b: grp[k + 1], d: Math.sqrt(sdx * sdx + sdy * sdy),
+        t: Math.random(), speed: 0.00005 + Math.random() * 0.0001,
+        live: Math.random() < 0.1, sib: true, curve: (Math.random() - 0.5) * 0.3
+      });
+    }
+  }
+
   for (var i = 0; i < nodes.length; i++) {
     var near = gridNear(nodes[i].x, nodes[i].y, EDGE_DIST);
     var sorted = [];
@@ -1604,6 +1689,7 @@ function buildEdges() {
   var semPerNode = {};
   for (var i = 0; i < nodes.length; i++) {
     if (!nodeKw[i].length) continue;
+    var famI = nodes[i].file.split("/")[0];
     var candidates = {};
     for (var k = 0; k < nodeKw[i].length; k++) {
       var matches = kwIndex[nodeKw[i][k]];
@@ -1611,6 +1697,9 @@ function buildEdges() {
       for (var m = 0; m < matches.length; m++) {
         var j = matches[m];
         if (j <= i || nodes[j].cluster === nodes[i].cluster) continue;
+        // sub-clusters of one family share vocabulary and sit adjacent —
+        // semantic edges between them are pure clutter
+        if (nodes[j].file.split("/")[0] === famI) continue;
         if (!candidates[j]) candidates[j] = 0;
         candidates[j]++;
       }
@@ -1620,7 +1709,7 @@ function buildEdges() {
       var shared = candidates[j];
       var maxLen = Math.max(nodeKw[i].length, nodeKw[jIdx].length);
       var score = shared / maxLen;
-      if (shared >= 2 && score >= 0.3) {
+      if (shared >= 3 && score >= 0.35) {
         semanticEdges.push({ a: i, b: jIdx, score: score, shared: shared });
       }
     }
@@ -1628,7 +1717,7 @@ function buildEdges() {
 
   semanticEdges.sort(function(a, b) { return b.score - a.score; });
 
-  var maxSemantic = Math.max(12, Math.floor(nodes.length * 0.1));
+  var maxSemantic = Math.max(12, Math.floor(nodes.length * 0.04));
   var semCount = 0;
   for (var i = 0; i < semanticEdges.length && semCount < maxSemantic; i++) {
     var se = semanticEdges[i];
@@ -1774,12 +1863,40 @@ function frame(ts) {
   gc.strokeStyle = FC(0.08 + flashTime * 0.02);
   gc.lineWidth = 0.5;
   for (var i = 0; i < edges.length; i++) {
-    if (!edges[i].semantic) {
+    if (!edges[i].semantic && !edges[i].sib && !edges[i].hier) {
       gc.moveTo(nodes[edges[i].a].x, nodes[edges[i].a].y);
       gc.lineTo(nodes[edges[i].b].x, nodes[edges[i].b].y);
     }
   }
   gc.stroke();
+
+  gc.beginPath();
+  gc.strokeStyle = FC(0.11 + flashTime * 0.02);
+  gc.lineWidth = 0.6;
+  for (var i = 0; i < edges.length; i++) {
+    if (edges[i].hier) {
+      gc.moveTo(nodes[edges[i].a].x, nodes[edges[i].a].y);
+      gc.lineTo(nodes[edges[i].b].x, nodes[edges[i].b].y);
+    }
+  }
+  gc.stroke();
+
+  gc.beginPath();
+  gc.strokeStyle = "rgba(200,150,70,0.28)";
+  gc.lineWidth = 0.7;
+  gc.setLineDash([3, 4]);
+  for (var i = 0; i < edges.length; i++) {
+    if (edges[i].sib) {
+      var sa = nodes[edges[i].a], sb = nodes[edges[i].b];
+      var mx = (sa.x + sb.x) / 2, my = (sa.y + sb.y) / 2;
+      var dx = sb.x - sa.x, dy = sb.y - sa.y;
+      var c = edges[i].curve || 0;
+      gc.moveTo(sa.x, sa.y);
+      gc.quadraticCurveTo(mx + (-dy) * c, my + dx * c, sb.x, sb.y);
+    }
+  }
+  gc.stroke();
+  gc.setLineDash([]);
 
   gc.beginPath();
   gc.strokeStyle = FC(0.12 + flashTime * 0.03);
@@ -1804,7 +1921,7 @@ function frame(ts) {
 
     if (isConn) {
       gc.beginPath();
-      if (e.semantic) {
+      if (e.semantic || e.sib) {
         var mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2;
         var edx = b.x - a.x, edy = b.y - a.y;
         var ec = e.curve || 0;
@@ -1814,9 +1931,11 @@ function frame(ts) {
         gc.moveTo(a.x, a.y);
         gc.lineTo(b.x, b.y);
       }
-      gc.strokeStyle = e.semantic ? "rgba(80,120,200,0.3)" : FC(0.3);
-      gc.lineWidth = e.semantic ? 1.2 : 1;
+      if (e.sib) gc.setLineDash([3, 4]);
+      gc.strokeStyle = e.sib ? "rgba(220,160,60,0.55)" : (e.semantic ? "rgba(80,120,200,0.3)" : FC(0.3));
+      gc.lineWidth = (e.semantic || e.sib) ? 1.2 : 1;
       gc.stroke();
+      if (e.sib) gc.setLineDash([]);
     }
 
     if (e.live) {
@@ -1824,7 +1943,7 @@ function frame(ts) {
       if (e.t > 1) { e.t -= 1; if (Math.random() < 0.2) e.live = false; }
       var t = e.t;
       var px, py;
-      if (e.semantic) {
+      if (e.semantic || e.sib) {
         var mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2;
         var edx = b.x - a.x, edy = b.y - a.y;
         var ec = e.curve || 0;
@@ -2565,18 +2684,26 @@ function clusterFreshness(nodesArr) {
 function renderClusterList() {
   clusterListEl.innerHTML = "";
   if (!brainData) return;
-  for (var i = 0; i < brainData.files.length; i++) {
-    var f = brainData.files[i];
+  // sort so sub-clusters ('projects/wisegraph') sit under their parent cluster
+  var sorted = brainData.files.slice().sort(function(a, b) {
+    return a.name < b.name ? -1 : a.name > b.name ? 1 : 0;
+  });
+  for (var i = 0; i < sorted.length; i++) {
+    var f = sorted[i];
+    var isSub = f.name.indexOf("/") !== -1;
     var item = document.createElement("div");
     item.className = "cluster-item";
+    if (isSub) item.style.paddingLeft = "26px";
 
     var dot = document.createElement("div");
     dot.className = "cluster-dot";
+    if (isSub) { dot.style.width = "7px"; dot.style.height = "7px"; }
     if (f.color) { dot.style.background = f.color; dot.style.borderColor = f.color; }
 
     var name = document.createElement("div");
     name.className = "cluster-name";
-    name.textContent = f.name;
+    name.textContent = isSub ? f.name.split("/").slice(1).join("/") : f.name;
+    name.title = f.name;
 
     var count = document.createElement("div");
     count.className = "cluster-count";
@@ -2946,18 +3073,19 @@ function reviewUpdateFile(filename, oldText, newText, action) {
     if (!found && stripped.startsWith("- ") && stripTs(stripped.slice(2)) === oldText) {
       found = true;
       if (action === "delete") continue;
-      if (action === "confirm") {
-        var p = parseTs(stripped.slice(2));
+      if (action === "confirm" || action === "edit") {
+        var p = parseMeta(stripped.slice(2));
         var prefix = lines[i].match(/^(\s*)/)[1];
-        var ts = " {{" + (p.created || todayStr()) + "|r:" + todayStr() + "}}";
-        newLines.push(prefix + "- " + p.text + ts);
-        continue;
-      }
-      if (action === "edit") {
-        var p = parseTs(stripped.slice(2));
-        var prefix = lines[i].match(/^(\s*)/)[1];
-        var ts = " {{" + (p.created || todayStr()) + "|r:" + todayStr() + "}}";
-        newLines.push(prefix + "- " + newText + ts);
+        var ts = " {{" + (p.created || todayStr()) + "|r:" + todayStr();
+        ts += "|i:" + (p.importance || 3);
+        if (p.source) ts += "|s:" + p.source;
+        if (p.tags && p.tags.length) ts += "|#" + p.tags.join(",");
+        if (p.expiry) ts += "|x:" + p.expiry;
+        if (p.rec) ts += "|rec:" + p.rec;
+        if (p.link) ts += "|ln:" + p.link;
+        if (p.id) ts += "|id:" + p.id;
+        ts += "}}";
+        newLines.push(prefix + "- " + (action === "edit" ? newText : p.text) + ts);
         continue;
       }
     }
