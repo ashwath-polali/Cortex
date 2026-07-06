@@ -2,6 +2,8 @@ import os
 import json
 import re
 import time
+import hmac
+import secrets as pysecrets
 from functools import wraps
 from datetime import date, timedelta
 from flask import Flask, request, jsonify, send_file, session, redirect
@@ -14,7 +16,9 @@ load_dotenv()
 app = Flask(__name__)
 CORS(app, origins=[os.getenv("CORS_ORIGIN", "http://localhost:5000"), "http://127.0.0.1:5000", "http://localhost:5000"])
 
-app.secret_key = os.getenv("FLASK_SECRET_KEY", "dev-fallback-key")
+# no static fallback: a known secret key means forgeable session cookies.
+# without the env var, sessions just reset on each deploy — safe failure mode.
+app.secret_key = os.getenv("FLASK_SECRET_KEY") or pysecrets.token_hex(32)
 app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(days=7)
 app.config["SESSION_COOKIE_HTTPONLY"] = True
 app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
@@ -328,11 +332,18 @@ button:hover {{ color: rgba(0,0,0,0.8); border-color: rgba(0,0,0,0.25); }}
 </body>
 </html>"""
 
+def _dev_mode():
+    # localhost dev without a password stays usable; any deployed env fails closed
+    return not os.getenv("VERCEL_ENV") and not os.getenv("CORS_ORIGIN")
+
+
 def require_auth(f):
     @wraps(f)
     def decorated(*args, **kwargs):
         if not CORTEX_PASSWORD:
-            return f(*args, **kwargs)
+            if _dev_mode():
+                return f(*args, **kwargs)
+            return jsonify({"error": "server not configured (CORTEX_PASSWORD unset)"}), 503
         if not session.get("authenticated"):
             if request.is_json:
                 return jsonify({"error": "unauthorized"}), 401
@@ -340,29 +351,52 @@ def require_auth(f):
         return f(*args, **kwargs)
     return decorated
 
+
+def _client_ip():
+    # first hop of X-Forwarded-For on Vercel; remote_addr locally
+    xff = request.headers.get("X-Forwarded-For", "")
+    if xff:
+        return xff.split(",")[0].strip()
+    return request.remote_addr or "unknown"
+
+
 _login_attempts = {}
 
 @app.route("/login", methods=["GET", "POST"])
 def login():
     if not CORTEX_PASSWORD:
-        return redirect("/")
+        if _dev_mode():
+            return redirect("/")
+        return login_page(error=True)
     if request.method == "GET":
         return login_page()
-    ip = request.remote_addr or "unknown"
+    ip = _client_ip()
     now = time.time()
     attempts = _login_attempts.get(ip, [])
     attempts = [t for t in attempts if now - t < 300]
     if len(attempts) >= 5:
         return login_page(error=True)
     password = request.form.get("password", "")
-    if password == CORTEX_PASSWORD:
+    if hmac.compare_digest(password.encode(), CORTEX_PASSWORD.encode()):
         _login_attempts.pop(ip, None)
+        session.clear()
         session.permanent = True
         session["authenticated"] = True
         return redirect("/")
     attempts.append(now)
     _login_attempts[ip] = attempts
     return login_page(error=True)
+
+
+@app.after_request
+def security_headers(resp):
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    resp.headers["X-Frame-Options"] = "DENY"
+    resp.headers["Referrer-Policy"] = "no-referrer"
+    resp.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+    if os.getenv("VERCEL_ENV"):
+        resp.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+    return resp
 
 @app.route("/favicon.png")
 def favicon():
@@ -523,8 +557,9 @@ def save():
             else:
                 aw_create({"filename": u["file"], "content": u["line"] + "\n"})
         return jsonify({"updates": updates, "has_conflicts": has_conflicts})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    except Exception:
+        app.logger.exception("internal error")
+        return jsonify({"error": "internal error"}), 500
 
 @app.post("/save/confirm")
 @require_auth
@@ -556,8 +591,9 @@ def save_confirm():
             content += new_line + "\n"
             aw_update(doc["$id"], {"content": content})
         return jsonify({"ok": True})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    except Exception:
+        app.logger.exception("internal error")
+        return jsonify({"error": "internal error"}), 500
 
 
 @app.post("/context")
@@ -656,8 +692,9 @@ def context():
             text = resp.content[0].text.strip()
             truncated = resp.stop_reason == "max_tokens"
             return jsonify({"context": text, "truncated": truncated})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    except Exception:
+        app.logger.exception("internal error")
+        return jsonify({"error": "internal error"}), 500
 
 @app.get("/memory")
 @require_auth
@@ -694,8 +731,9 @@ def delete_memory():
                 aw_delete(doc["$id"])
                 return jsonify({"ok": True})
         return jsonify({"error": "not found"}), 404
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    except Exception:
+        app.logger.exception("internal error")
+        return jsonify({"error": "internal error"}), 500
 
 @app.post("/memory/new")
 @require_auth
@@ -713,8 +751,9 @@ def create_memory():
                 return jsonify({"error": "already exists"}), 400
         aw_create({"filename": filename, "content": content})
         return jsonify({"ok": True})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    except Exception:
+        app.logger.exception("internal error")
+        return jsonify({"error": "internal error"}), 500
 
 @app.get("/search")
 @require_auth
@@ -758,8 +797,9 @@ def chat():
             messages=[{"role": "user", "content": msg}],
         )
         return jsonify({"reply": resp.content[0].text.strip()})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    except Exception:
+        app.logger.exception("internal error")
+        return jsonify({"error": "internal error"}), 500
 
 MCP_TOOLS = [
     {
@@ -1144,6 +1184,11 @@ def _track(cluster, action="read", source=""):
 
 @app.route("/activity", methods=["POST"])
 def post_activity():
+    key = request.headers.get("X-Api-Key", "")
+    authed = session.get("authenticated") or (
+        CORTEX_MCP_KEY and hmac.compare_digest(key.encode(), CORTEX_MCP_KEY.encode()))
+    if not authed:
+        return jsonify({"error": "unauthorized"}), 401
     data = request.get_json(silent=True) or {}
     _track(data.get("cluster", ""), data.get("action", "read"), data.get("source", ""))
     return jsonify({"ok": True})

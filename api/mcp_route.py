@@ -27,7 +27,13 @@ async def app(scope, receive, send):
     if scope["type"] == "lifespan":
         return await _sdk_app(scope, receive, send)
 
-    if CORTEX_MCP_KEY and scope["type"] == "http":
+    if scope["type"] == "http":
+        # fail closed: no configured key means no access, not open access
+        if not CORTEX_MCP_KEY:
+            return await _send_json(send, 503, {
+                "jsonrpc": "2.0", "id": None,
+                "error": {"code": -32000, "message": "server not configured"},
+            })
         headers = dict(scope.get("headers", []))
         auth = headers.get(b"authorization", b"").decode()
         api_key = headers.get(b"x-api-key", b"").decode()
@@ -40,7 +46,8 @@ async def app(scope, receive, send):
         if not key:
             key = api_key
 
-        if key != CORTEX_MCP_KEY:
+        import hmac
+        if not key or not hmac.compare_digest(key.encode(), CORTEX_MCP_KEY.encode()):
             return await _send_json(send, 401, {
                 "jsonrpc": "2.0", "id": None,
                 "error": {"code": -32000, "message": "unauthorized"},
