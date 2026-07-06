@@ -394,6 +394,7 @@ def signup_page(error=""):
 
 
 def account_page(user, new_key=None, msg="", error=""):
+    base = request.host_url
     today = date.today().isoformat()
     if user["role"] == "owner":
         usage = "unlimited"
@@ -419,6 +420,14 @@ def account_page(user, new_key=None, msg="", error=""):
     {key_html}
     <form method="POST" action="/account/key"><button type="submit">generate new key</button></form>
     <span class="alt">connects Claude / Perplexity to your brain via /mcp</span>
+  </div>
+  <div class="card">
+    <h2>connect your ai</h2>
+    <span class="alt">claude code (terminal):</span>
+    <div class="key">claude mcp add --transport http cortex {base}mcp --header "Authorization: Bearer YOUR_KEY"</div>
+    <span class="alt">claude desktop (claude_desktop_config.json):</span>
+    <div class="key">{{"mcpServers": {{"cortex": {{"command": "npx", "args": ["mcp-remote", "{base}mcp", "--header", "Authorization: Bearer YOUR_KEY"]}}}}}}</div>
+    <span class="alt">your AI then reads and saves memories automatically as you talk</span>
   </div>
   <div class="card">
     <h2>change password</h2>
