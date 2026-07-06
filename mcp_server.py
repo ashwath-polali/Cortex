@@ -29,13 +29,104 @@ from datetime import date
 from difflib import SequenceMatcher
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
-from db import (db_list, db_find, db_names, db_create, db_update, db_update_cas,
-                db_delete, db_rename, db_log_activity, db_get_activity)
+import contextvars
+
+from db import (db_list as _raw_list, db_find as _raw_find, db_names as _raw_names,
+                db_create as _raw_create, db_update as _raw_update,
+                db_update_cas as _raw_update_cas, db_delete as _raw_delete,
+                db_rename as _raw_rename, db_log_activity as _raw_log_activity,
+                db_get_activity as _raw_get_activity, db_brain_bytes, user_owner)
 
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 
 import json as _json
 import time as _time
+
+# ---- tenant context ---------------------------------------------------------
+# HTTP MCP requests set the user per-request (api/mcp_route.py). Local stdio
+# runs resolve the owner account once. Every db call below injects _uid(), so
+# an unscoped (cross-tenant) query cannot be expressed from tool code.
+
+_user_ctx = contextvars.ContextVar("cortex_user_id", default=None)
+_role_ctx = contextvars.ContextVar("cortex_user_role", default="owner")
+_stdio_uid = None
+
+MAX_BRAIN_BYTES = int(os.getenv("MAX_BRAIN_BYTES", "2000000"))
+
+
+def set_request_user(user_id, role):
+    return _user_ctx.set(user_id), _role_ctx.set(role)
+
+
+def reset_request_user(tokens):
+    _user_ctx.reset(tokens[0])
+    _role_ctx.reset(tokens[1])
+
+
+def _uid():
+    uid = _user_ctx.get()
+    if uid:
+        return uid
+    global _stdio_uid
+    if _stdio_uid is None:
+        _stdio_uid = os.getenv("CORTEX_USER_ID", "")
+        if not _stdio_uid:
+            o = user_owner()
+            if not o:
+                raise RuntimeError("no owner account — run migrate_multiuser.py first")
+            _stdio_uid = o["id"]
+    return _stdio_uid
+
+
+def _check_quota(added_len):
+    if _role_ctx.get() == "owner":
+        return
+    if db_brain_bytes(_uid()) + added_len > MAX_BRAIN_BYTES:
+        raise ValueError("brain storage quota exceeded — delete old memories first")
+
+
+def db_list(include_internal=False):
+    return _raw_list(_uid(), include_internal)
+
+
+def db_find(filename):
+    return _raw_find(_uid(), filename)
+
+
+def db_names():
+    return _raw_names(_uid())
+
+
+def db_create(filename, content):
+    _check_quota(len(content))
+    return _raw_create(_uid(), filename, content)
+
+
+def db_update(doc_id, content):
+    _check_quota(0)
+    return _raw_update(_uid(), doc_id, content)
+
+
+def db_update_cas(doc_id, old_content, new_content):
+    _check_quota(max(0, len(new_content) - len(old_content)))
+    return _raw_update_cas(_uid(), doc_id, old_content, new_content)
+
+
+def db_delete(doc_id):
+    return _raw_delete(_uid(), doc_id)
+
+
+def db_rename(doc_id, filename):
+    return _raw_rename(_uid(), doc_id, filename)
+
+
+def db_log_activity(event):
+    return _raw_log_activity(_uid(), event)
+
+
+def db_get_activity():
+    return _raw_get_activity(_uid())
+
 
 def emit_activity(cluster, action="read", source=""):
     try:

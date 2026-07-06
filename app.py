@@ -28,21 +28,59 @@ client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 MODEL = "claude-haiku-4-5-20251001"
 CORTEX_PASSWORD = os.getenv("CORTEX_PASSWORD", "")
 CORTEX_MCP_KEY = os.getenv("CORTEX_MCP_KEY", "")
+AI_DAILY_QUOTA = int(os.getenv("AI_DAILY_QUOTA", "10"))
+MAX_BRAIN_BYTES = int(os.getenv("MAX_BRAIN_BYTES", "2000000"))
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
-from db import db_list, db_create, db_update, db_delete, db_log_activity, db_get_activity
+from werkzeug.security import generate_password_hash, check_password_hash
+from db import (db_list, db_create, db_update, db_delete, db_log_activity,
+                db_get_activity, db_brain_bytes, db_all_users_docs,
+                user_create, user_by_email, user_by_id, user_count, user_owner,
+                user_set_key_hash, user_by_key_hash, user_set_password,
+                user_ai_spend, user_ai_usage, hash_key, rate_check)
+
+_owner_cache = {}
+
+
+def _owner():
+    if "u" not in _owner_cache:
+        _owner_cache["u"] = user_owner()
+    return _owner_cache["u"]
+
+
+def _uid_web():
+    uid = session.get("user_id")
+    if uid:
+        return uid
+    if _dev_mode():
+        o = _owner()
+        if o:
+            return o["id"]
+    return None
+
+
+def _role_web():
+    return session.get("role", "owner" if _dev_mode() else "user")
+
+
+def _check_storage(added_len=0):
+    """Non-owner writes respect the per-user brain cap."""
+    if _role_web() == "owner":
+        return True
+    return db_brain_bytes(_uid_web()) + added_len <= MAX_BRAIN_BYTES
+
 
 def aw_list():
-    return {"documents": db_list()}
+    return {"documents": db_list(_uid_web())}
 
 def aw_create(data):
-    return db_create(data["filename"], data.get("content", ""))
+    return db_create(_uid_web(), data["filename"], data.get("content", ""))
 
 def aw_update(doc_id, data):
-    db_update(doc_id, data["content"])
+    db_update(_uid_web(), doc_id, data["content"])
 
 def aw_delete(doc_id):
-    db_delete(doc_id)
+    db_delete(_uid_web(), doc_id)
 
 SEED_TEMPLATES = [
     {"filename": "core.md", "content": "## identity\n- name:\n- location:\n- goal:\n"},
@@ -247,9 +285,9 @@ def find_conflicts(new_bullet, existing_content):
 
 
 def auto_decay():
+    # maintenance across every user's brain: expired |x: bullets are removed
     today_str = date.today().isoformat()
-    resp = aw_list()
-    for doc in resp["documents"]:
+    for user_id, doc in db_all_users_docs():
         if doc["filename"].startswith("_"):
             continue
         lines = doc["content"].split("\n")
@@ -262,15 +300,7 @@ def auto_decay():
                 continue
             new_lines.append(line)
         if changed:
-            aw_update(doc["$id"], {"content": "\n".join(new_lines)})
-
-def seed_brain():
-    resp = aw_list()
-    if resp["documents"]:
-        return
-    for t in SEED_TEMPLATES:
-        aw_create(t)
-    print("Seeded brain templates into Appwrite")
+            db_update(user_id, doc["$id"], "\n".join(new_lines))
 
 def read_brain():
     resp = aw_list()
@@ -285,8 +315,41 @@ def brain_as_text():
         parts.append(f"=== {fname} ===\n{content}")
     return "\n".join(parts)
 
-def login_page(error=False):
-    err = '<p class="err">wrong password</p>' if error else ''
+AUTH_CSS = """
+*, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+  background: linear-gradient(145deg, #ffffff 0%, #f0f1f3 50%, #e8eaed 100%);
+  min-height: 100vh; display: flex; align-items: center; justify-content: center;
+  font-family: 'JetBrains Mono', monospace;
+}
+.login { display: flex; flex-direction: column; align-items: center; gap: 16px; }
+.logo { width: 48px; height: 48px; opacity: 0.15; }
+.title { font-size: 11px; letter-spacing: 0.25em; color: rgba(0,0,0,0.12); text-transform: uppercase; }
+input {
+  width: 260px; padding: 10px 14px; border: 1px solid rgba(0,0,0,0.1);
+  border-radius: 10px; background: #fff; font-family: 'JetBrains Mono', monospace;
+  font-size: 13px; color: rgba(0,0,0,0.8); outline: none; text-align: center;
+}
+input::placeholder { color: rgba(0,0,0,0.2); }
+input:focus { border-color: rgba(0,0,0,0.25); }
+button {
+  font-family: 'JetBrains Mono', monospace; font-size: 11px; padding: 8px 24px;
+  border-radius: 999px; border: 1px solid rgba(0,0,0,0.1);
+  background: transparent; color: rgba(0,0,0,0.45); cursor: pointer;
+}
+button:hover { color: rgba(0,0,0,0.8); border-color: rgba(0,0,0,0.25); }
+.err { font-size: 11px; color: rgba(180,0,0,0.6); }
+.alt { font-size: 10px; color: rgba(0,0,0,0.3); }
+.alt a { color: rgba(0,0,0,0.45); }
+.hp { position: absolute; left: -9999px; opacity: 0; }
+.card { background: #fff; border: 1px solid rgba(0,0,0,0.08); border-radius: 14px; padding: 24px 28px; width: 340px; display: flex; flex-direction: column; gap: 12px; }
+.card h2 { font-size: 11px; letter-spacing: 0.2em; color: rgba(0,0,0,0.3); text-transform: uppercase; }
+.row { font-size: 12px; color: rgba(0,0,0,0.6); display: flex; justify-content: space-between; }
+.key { font-size: 11px; word-break: break-all; background: rgba(0,0,0,0.04); padding: 8px; border-radius: 8px; color: rgba(0,0,0,0.7); }
+"""
+
+
+def _page(body):
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -295,59 +358,103 @@ def login_page(error=False):
 <title>Cortex</title>
 <link rel="icon" type="image/png" href="/favicon.png">
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
-<style>
-*, *::before, *::after {{ margin: 0; padding: 0; box-sizing: border-box; }}
-body {{
-  background: linear-gradient(145deg, #ffffff 0%, #f0f1f3 50%, #e8eaed 100%);
-  height: 100vh; display: flex; align-items: center; justify-content: center;
-  font-family: 'JetBrains Mono', monospace;
-}}
-.login {{ display: flex; flex-direction: column; align-items: center; gap: 16px; }}
-.logo {{ width: 48px; height: 48px; opacity: 0.15; }}
-.title {{ font-size: 11px; letter-spacing: 0.25em; color: rgba(0,0,0,0.12); text-transform: uppercase; }}
-input {{
-  width: 260px; padding: 10px 14px; border: 1px solid rgba(0,0,0,0.1);
-  border-radius: 10px; background: #fff; font-family: 'JetBrains Mono', monospace;
-  font-size: 13px; color: rgba(0,0,0,0.8); outline: none; text-align: center;
-}}
-input::placeholder {{ color: rgba(0,0,0,0.2); }}
-input:focus {{ border-color: rgba(0,0,0,0.25); }}
-button {{
-  font-family: 'JetBrains Mono', monospace; font-size: 11px; padding: 8px 24px;
-  border-radius: 999px; border: 1px solid rgba(0,0,0,0.1);
-  background: transparent; color: rgba(0,0,0,0.45); cursor: pointer;
-}}
-button:hover {{ color: rgba(0,0,0,0.8); border-color: rgba(0,0,0,0.25); }}
-.err {{ font-size: 11px; color: rgba(180,0,0,0.6); }}
-</style>
+<style>{AUTH_CSS}</style>
 </head>
-<body>
-<form class="login" method="POST">
-  <img src="/favicon.png" class="logo" alt="Cortex">
-  <span class="title">cortex / memory</span>
-  <input type="password" name="password" placeholder="password" autofocus>
-  <button type="submit">enter</button>
-  {err}
-</form>
-</body>
+<body>{body}</body>
 </html>"""
 
+
+def login_page(error=""):
+    err = f'<p class="err">{error}</p>' if error else ''
+    return _page(f"""
+<form class="login" method="POST" action="/login">
+  <img src="/favicon.png" class="logo" alt="Cortex">
+  <span class="title">cortex / memory</span>
+  <input type="email" name="email" placeholder="email" autofocus autocomplete="username">
+  <input type="password" name="password" placeholder="password" autocomplete="current-password">
+  <button type="submit">enter</button>
+  {err}
+  <span class="alt">no account? <a href="/signup">sign up</a></span>
+</form>""")
+
+
+def signup_page(error=""):
+    err = f'<p class="err">{error}</p>' if error else ''
+    return _page(f"""
+<form class="login" method="POST" action="/signup">
+  <img src="/favicon.png" class="logo" alt="Cortex">
+  <span class="title">cortex / new brain</span>
+  <input type="email" name="email" placeholder="email" autofocus autocomplete="username">
+  <input type="password" name="password" placeholder="password (8+ chars)" autocomplete="new-password">
+  <input class="hp" type="text" name="website" tabindex="-1" autocomplete="off">
+  <button type="submit">create account</button>
+  {err}
+  <span class="alt">have an account? <a href="/login">log in</a></span>
+</form>""")
+
+
+def account_page(user, new_key=None, msg="", error=""):
+    today = date.today().isoformat()
+    if user["role"] == "owner":
+        usage = "unlimited"
+        cap = "unlimited"
+    else:
+        usage = f"{user_ai_usage(user['id'], today)} / {AI_DAILY_QUOTA} today"
+        cap = f"{db_brain_bytes(user['id']) // 1024} / {MAX_BRAIN_BYTES // 1024} KB"
+    key_html = f'<div class="key">{new_key}</div><span class="alt">copy it now — it is shown once and stored hashed</span>' if new_key else ''
+    note = f'<p class="err">{error}</p>' if error else (f'<span class="alt">{msg}</span>' if msg else '')
+    return _page(f"""
+<div class="login">
+  <img src="/favicon.png" class="logo" alt="Cortex">
+  <span class="title">cortex / account</span>
+  <div class="card">
+    <h2>identity</h2>
+    <div class="row"><span>email</span><span>{user['email']}</span></div>
+    <div class="row"><span>role</span><span>{user['role']}</span></div>
+    <div class="row"><span>ai calls</span><span>{usage}</span></div>
+    <div class="row"><span>brain size</span><span>{cap}</span></div>
+  </div>
+  <div class="card">
+    <h2>mcp api key</h2>
+    {key_html}
+    <form method="POST" action="/account/key"><button type="submit">generate new key</button></form>
+    <span class="alt">connects Claude / Perplexity to your brain via /mcp</span>
+  </div>
+  <div class="card">
+    <h2>change password</h2>
+    <form method="POST" action="/account/password" style="display:flex;flex-direction:column;gap:8px;">
+      <input type="password" name="current" placeholder="current password" autocomplete="current-password">
+      <input type="password" name="new" placeholder="new password (8+ chars)" autocomplete="new-password">
+      <button type="submit">change</button>
+    </form>
+  </div>
+  {note}
+  <span class="alt"><a href="/">back to brain</a> · <a href="/logout">log out</a></span>
+</div>""")
+
 def _dev_mode():
-    # localhost dev without a password stays usable; any deployed env fails closed
+    # localhost dev stays usable as the owner; any deployed env requires login
     return not os.getenv("VERCEL_ENV") and not os.getenv("CORS_ORIGIN")
 
 
 def require_auth(f):
     @wraps(f)
     def decorated(*args, **kwargs):
-        if not CORTEX_PASSWORD:
-            if _dev_mode():
-                return f(*args, **kwargs)
-            return jsonify({"error": "server not configured (CORTEX_PASSWORD unset)"}), 503
-        if not session.get("authenticated"):
-            if request.is_json:
-                return jsonify({"error": "unauthorized"}), 401
-            return redirect("/login")
+        if session.get("user_id") or _dev_mode():
+            return f(*args, **kwargs)
+        if request.is_json:
+            return jsonify({"error": "unauthorized"}), 401
+        return redirect("/login")
+    return decorated
+
+
+def require_ai_quota(f):
+    """Haiku endpoints: owner unlimited, others AI_DAILY_QUOTA calls/day."""
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if _role_web() != "owner":
+            if not user_ai_spend(_uid_web(), date.today().isoformat(), AI_DAILY_QUOTA):
+                return jsonify({"error": f"daily AI quota reached ({AI_DAILY_QUOTA}/day)"}), 429
         return f(*args, **kwargs)
     return decorated
 
@@ -360,32 +467,102 @@ def _client_ip():
     return request.remote_addr or "unknown"
 
 
-_login_attempts = {}
+def _rate_ok(bucket, limit, window):
+    try:
+        return rate_check(bucket, limit, window)
+    except Exception:
+        return True  # a broken limiter must not lock out logins entirely
+
+
+def _login_user(u):
+    session.clear()
+    session.permanent = True
+    session["user_id"] = u["id"]
+    session["role"] = u["role"]
+
+
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
 
 @app.route("/login", methods=["GET", "POST"])
 def login():
-    if not CORTEX_PASSWORD:
-        if _dev_mode():
-            return redirect("/")
-        return login_page(error=True)
     if request.method == "GET":
-        return login_page()
-    ip = _client_ip()
-    now = time.time()
-    attempts = _login_attempts.get(ip, [])
-    attempts = [t for t in attempts if now - t < 300]
-    if len(attempts) >= 5:
-        return login_page(error=True)
+        return redirect("/") if _dev_mode() and not user_count() else login_page()
+    if not _rate_ok(f"login:{_client_ip()}", 8, 300):
+        return login_page("too many attempts — wait a few minutes")
+    email = request.form.get("email", "").strip().lower()
     password = request.form.get("password", "")
-    if hmac.compare_digest(password.encode(), CORTEX_PASSWORD.encode()):
-        _login_attempts.pop(ip, None)
-        session.clear()
-        session.permanent = True
-        session["authenticated"] = True
+    u = user_by_email(email) if email else None
+    if u and check_password_hash(u["pw_hash"], password):
+        _login_user(u)
         return redirect("/")
-    attempts.append(now)
-    _login_attempts[ip] = attempts
-    return login_page(error=True)
+    # legacy bootstrap: no accounts yet + the original single password matches
+    # -> this login becomes the owner account and adopts all existing memories
+    if (not u and user_count() == 0 and CORTEX_PASSWORD and password
+            and hmac.compare_digest(password.encode(), CORTEX_PASSWORD.encode())
+            and EMAIL_RE.match(email)):
+        uid = user_create(email, generate_password_hash(password), role="owner")
+        from db import adopt_orphan_docs
+        adopt_orphan_docs(uid)
+        _owner_cache.clear()
+        _login_user(user_by_id(uid))
+        return redirect("/")
+    return login_page("wrong email or password")
+
+
+@app.route("/signup", methods=["GET", "POST"])
+def signup():
+    if request.method == "GET":
+        return signup_page()
+    if request.form.get("website"):
+        return signup_page("signup failed")  # honeypot
+    if not _rate_ok(f"signup:{_client_ip()}", 5, 3600):
+        return signup_page("too many signups from this address — try later")
+    email = request.form.get("email", "").strip().lower()
+    password = request.form.get("password", "")
+    if not EMAIL_RE.match(email):
+        return signup_page("enter a valid email")
+    if len(password) < 8:
+        return signup_page("password must be at least 8 characters")
+    if user_by_email(email):
+        return signup_page("that email already has an account")
+    uid = user_create(email, generate_password_hash(password))
+    for t in SEED_TEMPLATES:
+        db_create(uid, t["filename"], t["content"])
+    _login_user(user_by_id(uid))
+    return redirect("/")
+
+
+@app.route("/account")
+@require_auth
+def account():
+    u = user_by_id(_uid_web())
+    if not u:
+        return redirect("/login")
+    return account_page(u)
+
+
+@app.post("/account/key")
+@require_auth
+def account_key():
+    u = user_by_id(_uid_web())
+    token = "ctx_" + pysecrets.token_urlsafe(32)
+    user_set_key_hash(u["id"], hash_key(token))
+    return account_page(u, new_key=token)
+
+
+@app.post("/account/password")
+@require_auth
+def account_password():
+    u = user_by_id(_uid_web())
+    cur = request.form.get("current", "")
+    new = request.form.get("new", "")
+    if not check_password_hash(u["pw_hash"], cur):
+        return account_page(u, error="current password is wrong")
+    if len(new) < 8:
+        return account_page(u, error="new password must be at least 8 characters")
+    user_set_password(u["id"], generate_password_hash(new))
+    return account_page(user_by_id(u["id"]), msg="password changed")
 
 
 @app.after_request
@@ -456,8 +633,11 @@ def brain():
 
 @app.post("/save")
 @require_auth
+@require_ai_quota
 def save():
     try:
+        if not _check_storage(2000):
+            return jsonify({"error": "brain storage quota reached"}), 413
         msg = request.json.get("message", "")
         target_hint = request.json.get("target", "")
         all_docs = aw_list()["documents"]
@@ -565,6 +745,8 @@ def save():
 @require_auth
 def save_confirm():
     try:
+        if not _check_storage(2000):
+            return jsonify({"error": "brain storage quota reached"}), 413
         items = request.json.get("updates", [])
         all_docs = aw_list()["documents"]
         existing = {d["filename"]: d for d in all_docs}
@@ -598,6 +780,7 @@ def save_confirm():
 
 @app.post("/context")
 @require_auth
+@require_ai_quota
 def context():
     try:
         topic = request.json.get("topic", "").strip()
@@ -715,6 +898,8 @@ def update_memory():
     content = request.json.get("content", "")
     if not doc_id:
         return jsonify({"error": "missing id"}), 400
+    if not _check_storage(len(content)):
+        return jsonify({"error": "brain storage quota reached"}), 413
     aw_update(doc_id, {"content": content})
     return jsonify({"ok": True})
 
@@ -745,6 +930,8 @@ def create_memory():
             return jsonify({"error": "missing filename"}), 400
         if not filename.endswith(".md"):
             filename += ".md"
+        if not _check_storage(len(content)):
+            return jsonify({"error": "brain storage quota reached"}), 413
         resp = aw_list()
         for doc in resp["documents"]:
             if doc["filename"] == filename:
@@ -779,6 +966,7 @@ def search():
 
 @app.post("/chat")
 @require_auth
+@require_ai_quota
 def chat():
     try:
         msg = request.json.get("message", "")
@@ -801,420 +989,54 @@ def chat():
         app.logger.exception("internal error")
         return jsonify({"error": "internal error"}), 500
 
-MCP_TOOLS = [
-    {
-        "name": "get_full_brain",
-        "description": "Get ALL brain data across every cluster. Returns all memory files with their contents.",
-        "inputSchema": {"type": "object", "properties": {}},
-    },
-    {
-        "name": "get_cluster",
-        "description": "Read a specific brain cluster by filename. Use when you need detailed info from one area.",
-        "inputSchema": {"type": "object", "properties": {"filename": {"type": "string", "description": "Cluster filename, e.g. 'core.md'"}}, "required": ["filename"]},
-    },
-    {
-        "name": "list_clusters",
-        "description": "List all brain clusters with section headers and bullet counts. Use to see what memory areas exist.",
-        "inputSchema": {"type": "object", "properties": {}},
-    },
-    {
-        "name": "search_brain",
-        "description": "Search across all brain data for a keyword or phrase. Returns matching lines with source file.",
-        "inputSchema": {"type": "object", "properties": {"query": {"type": "string", "description": "Search term"}}, "required": ["query"]},
-    },
-    {
-        "name": "get_context_for_topic",
-        "description": "Get brain data relevant to a specific topic. Auto-selects the most relevant clusters.",
-        "inputSchema": {"type": "object", "properties": {"topic": {"type": "string", "description": "Topic to get context for"}}, "required": ["topic"]},
-    },
-    {
-        "name": "save_to_brain",
-        "description": "Append a new memory to a brain cluster. REQUIRED: give every memory an importance 1-5 (5=life-defining identity/values/major goals, 4=major projects/key relationships/hard commitments, 3=normal useful fact, 2=minor/secondary detail, 1=trivial or short-lived). Save freely - do not skip saving useful info; just rank it honestly. Put one complete thought per bullet; if a fact directly continues/extends another, pass 'parent' to nest it as a sub-bullet instead of creating a dangling separate bullet.",
-        "inputSchema": {"type": "object", "properties": {"filename": {"type": "string", "description": "Target cluster filename"}, "bullet": {"type": "string", "description": "Fact to save as a bullet point (one complete thought)"}, "importance": {"type": "integer", "minimum": 1, "maximum": 5, "description": "1-5 importance. Required - rank honestly."}, "section": {"type": "string", "description": "Target ## section name inside the cluster. Read the cluster first to find section names."}, "parent": {"type": "string", "description": "Optional: a unique substring of an existing bullet this fact continues/extends. Nests this as a sub-bullet under it instead of a separate sibling."}, "expiry": {"type": "string", "description": "Optional expiry date YYYY-MM-DD for genuinely time-bound facts (auto-deletes after)"}, "source": {"type": "string", "description": "Source client (claude, perplexity, etc)"}, "rec": {"type": "string", "enum": ["pending", "confirmed"], "description": "Recommendation status. Use 'pending' when saving an AI recommendation. Use 'confirmed' when upgrading a recommendation the user accepted. Omit for normal factual memories."}}, "required": ["filename", "bullet", "importance"]},
-    },
-    {
-        "name": "set_importance",
-        "description": "Update the 1-5 importance ranking of an existing memory bullet. Use when re-evaluating how much a memory matters.",
-        "inputSchema": {"type": "object", "properties": {"filename": {"type": "string", "description": "Cluster filename"}, "bullet_text": {"type": "string", "description": "Unique substring of the bullet to re-rank"}, "importance": {"type": "integer", "minimum": 1, "maximum": 5, "description": "New 1-5 importance"}}, "required": ["filename", "bullet_text", "importance"]},
-    },
-    {
-        "name": "create_cluster",
-        "description": "Create a new brain cluster with initial content. Use when information doesn't fit any existing cluster. Provide full markdown with ## sections and - bullet points. Each bullet should be a single fact.",
-        "inputSchema": {"type": "object", "properties": {"filename": {"type": "string", "description": "New cluster filename (e.g. 'hobbies.md')"}, "content": {"type": "string", "description": "Full markdown content with ## sections and - bullets"}, "source": {"type": "string", "description": "Source client (claude, perplexity, etc)"}, "scope": {"type": "string", "enum": ["build", "strategy"], "description": "Cluster scope: 'build' for project/code, 'strategy' for life/goals"}}, "required": ["filename", "content"]},
-    },
-    {
-        "name": "get_brain_summary",
-        "description": "Quick identity snapshot — who the user is, core facts. Use for a fast intro without loading everything.",
-        "inputSchema": {"type": "object", "properties": {}},
-    },
-    {
-        "name": "edit_bullet",
-        "description": "Edit an existing bullet in a cluster. Call get_cluster first to find the exact bullet text. Pass old_text as a unique substring of the bullet. new_text is the replacement.",
-        "inputSchema": {"type": "object", "properties": {"filename": {"type": "string", "description": "Cluster filename"}, "old_text": {"type": "string", "description": "Unique substring of the bullet to find"}, "new_text": {"type": "string", "description": "Replacement bullet text"}, "source": {"type": "string", "description": "Source client"}}, "required": ["filename", "old_text", "new_text"]},
-    },
-    {
-        "name": "delete_bullet",
-        "description": "Delete a bullet from a cluster. Call get_cluster first to find the exact bullet text. Pass old_text as a unique substring of the bullet line to remove.",
-        "inputSchema": {"type": "object", "properties": {"filename": {"type": "string", "description": "Cluster filename"}, "old_text": {"type": "string", "description": "Unique substring of the bullet to delete"}}, "required": ["filename", "old_text"]},
-    },
-    {
-        "name": "delete_section",
-        "description": "Delete an entire ## section and all its bullets from a cluster. Call get_cluster first to confirm the section name.",
-        "inputSchema": {"type": "object", "properties": {"filename": {"type": "string", "description": "Cluster filename"}, "section": {"type": "string", "description": "Exact ## section header name to delete"}}, "required": ["filename", "section"]},
-    },
-]
-
-
-def mcp_get_full_brain():
-    docs = aw_list()["documents"]
-    parts = []
-    for doc in sorted(docs, key=lambda d: d["filename"]):
-        lines = [l for l in doc["content"].split("\n") if not l.strip().startswith("<!-- color:")]
-        parts.append(f"=== {doc['filename']} ===\n" + "\n".join(lines))
-    return "\n\n".join(parts) if parts else "brain is empty"
-
-
-def mcp_get_cluster(filename):
-    if not filename.endswith(".md"):
-        filename += ".md"
-    docs = aw_list()["documents"]
-    for doc in docs:
-        if doc["filename"] == filename:
-            lines = [l for l in doc["content"].split("\n") if not l.strip().startswith("<!-- color:")]
-            return "\n".join(lines)
-    available = [d["filename"] for d in docs]
-    return f"'{filename}' not found. Available: {', '.join(available)}"
-
-
-def mcp_list_clusters():
-    docs = aw_list()["documents"]
-    lines = []
-    for doc in sorted(docs, key=lambda d: d["filename"]):
-        headers = []
-        bullet_count = 0
-        for line in doc["content"].split("\n"):
-            stripped = line.strip()
-            if stripped.startswith("##"):
-                headers.append(stripped)
-            elif stripped.startswith("- "):
-                bullet_count += 1
-        lines.append(f"{doc['filename']} — {bullet_count} items — {', '.join(headers) if headers else '(no sections)'}")
-    return "\n".join(lines) if lines else "no clusters"
-
-
-def mcp_search_brain(query):
-    q = query.lower().strip()
-    if not q:
-        return "empty query"
-    docs = aw_list()["documents"]
-    results = []
-    for doc in docs:
-        for line in doc["content"].split("\n"):
-            stripped = line.strip()
-            if not stripped or stripped.startswith("<!-- color:"):
-                continue
-            if q in stripped.lower():
-                results.append(f"[{doc['filename']}] {stripped}")
-    return "\n".join(results) if results else f"no matches for '{query}'"
-
-
-def mcp_get_context_for_topic(topic):
-    docs = aw_list()["documents"]
-    selected = select_files(topic, docs, max_files=4)
-    parts = []
-    for fname, content in selected.items():
-        lines = [l for l in content.split("\n") if not l.strip().startswith("<!-- color:")]
-        parts.append(f"=== {fname} ===\n" + "\n".join(lines))
-    return "\n\n".join(parts) if parts else f"no relevant data for '{topic}'"
-
-
-def _insert_under_section(content, section, bullet):
-    lines = content.split("\n")
-    section_lower = section.lower().strip().lstrip("#").strip()
-    best_idx = -1
-    for i, line in enumerate(lines):
-        if line.strip().startswith("##"):
-            header_text = line.strip().lstrip("#").strip().lower()
-            if header_text == section_lower:
-                best_idx = i
-                break
-    if best_idx == -1:
-        if not content.endswith("\n"):
-            content += "\n"
-        return content + "\n## " + section.strip().lstrip("#").strip() + "\n" + bullet + "\n"
-    insert_at = best_idx + 1
-    while insert_at < len(lines):
-        stripped = lines[insert_at].strip()
-        if stripped.startswith("##"):
-            break
-        if stripped == "":
-            insert_at += 1
-            continue
-        insert_at += 1
-    lines.insert(insert_at, bullet)
-    return "\n".join(lines)
-
-
-def mcp_save_to_brain(filename, bullet, importance=3, expiry=None, source=None, section=None, rec=None, parent=None):
-    if not filename.endswith(".md"):
-        filename += ".md"
-    bullet = bullet.strip()
-    if bullet.startswith("- "):
-        bullet = bullet[2:].strip()
-    if not source:
-        source = "mcp"
-    if rec and rec not in ("pending", "confirmed"):
-        rec = None
-    importance = clamp_importance(importance)
-    docs = aw_list()["documents"]
-    for doc in docs:
-        if doc["filename"] == filename:
-            lines = doc["content"].split("\n")
-            if parent:
-                pidx = -1
-                for i, line in enumerate(lines):
-                    if line.strip().startswith("- ") and parent.strip() in line:
-                        pidx = i
-                        break
-                if pidx == -1:
-                    return f"parent bullet matching '{parent}' not found in {filename}"
-                child = stamp_bullet("  - " + bullet, importance=importance, expiry=expiry, source=source, rec=rec)
-                ins = pidx + 1
-                while ins < len(lines) and lines[ins].startswith("  - "):
-                    ins += 1
-                lines.insert(ins, child)
-                aw_update(doc["$id"], {"content": "\n".join(lines)})
-                return f"saved under '{parent.strip()}' in {filename}: {child.strip()}"
-            stamped = stamp_bullet("- " + bullet, importance=importance, expiry=expiry, source=source, rec=rec)
-            content = doc["content"]
-            if section:
-                content = _insert_under_section(content, section, stamped)
-            else:
-                if not content.endswith("\n"):
-                    content += "\n"
-                content += stamped + "\n"
-            aw_update(doc["$id"], {"content": content})
-            target = f"{filename} > {section}" if section else filename
-            return f"saved to {target}: {stamped}"
-    available = [d["filename"] for d in docs]
-    return f"'{filename}' not found. Available: {', '.join(available)}"
-
-
-def mcp_create_cluster(filename, content, source=None, scope=None):
-    if not filename.endswith(".md"):
-        filename += ".md"
-    docs = aw_list()["documents"]
-    for doc in docs:
-        if doc["filename"] == filename:
-            return f"'{filename}' already exists — use save_to_brain to add to it"
-    if not source:
-        source = "mcp"
-    lines = content.split("\n")
-    stamped = []
-    if scope in ("build", "strategy"):
-        stamped.append(f"<!-- scope:{scope} -->")
-    for line in lines:
-        stripped = line.strip()
-        if stripped.startswith("- ") and not re.search(r"\{\{\d{4}-\d{2}-\d{2}", stripped):
-            meta = "{{" + date.today().isoformat() + "|i:3|s:" + source + "}}"
-            stamped.append(stripped.rstrip() + " " + meta)
-        else:
-            stamped.append(line)
-    final = "\n".join(stamped)
-    if not final.endswith("\n"):
-        final += "\n"
-    aw_create({"filename": filename, "content": final})
-    return f"created {filename} [{scope or 'all'}] with {sum(1 for l in stamped if l.strip().startswith('- '))} bullets"
-
-
-def mcp_get_brain_summary():
-    docs = aw_list()["documents"]
-    for doc in docs:
-        if doc["filename"] == "core.md":
-            lines = [l for l in doc["content"].split("\n") if not l.strip().startswith("<!-- color:")]
-            return "\n".join(lines)
-    return "core.md not found"
-
-
-def mcp_edit_bullet(filename, old_text, new_text, source=None):
-    if not filename.endswith(".md"):
-        filename += ".md"
-    docs = aw_list()["documents"]
-    for doc in docs:
-        if doc["filename"] == filename:
-            lines = doc["content"].split("\n")
-            match_idx = -1
-            for i, line in enumerate(lines):
-                if old_text.strip() in line:
-                    match_idx = i
-                    break
-            if match_idx == -1:
-                return f"no bullet matching '{old_text}' found in {filename}"
-            old_line = lines[match_idx]
-            indent = "  " if (old_line.startswith("  - ") or old_line.startswith("\t- ")) else ""
-            old_imp = parse_meta(old_line.strip()[2:])["importance"] if old_line.strip().startswith("- ") else 3
-            if not new_text.startswith("- "):
-                new_text = "- " + new_text
-            if not source:
-                source = "mcp"
-            new_text = stamp_bullet(new_text, importance=old_imp, source=source)
-            lines[match_idx] = indent + new_text
-            content = "\n".join(lines)
-            aw_update(doc["$id"], {"content": content})
-            return f"edited in {filename}: '{old_text.strip()}' → '{new_text.strip()}'"
-    available = [d["filename"] for d in docs]
-    return f"'{filename}' not found. Available: {', '.join(available)}"
-
-
-def mcp_delete_bullet(filename, old_text):
-    if not filename.endswith(".md"):
-        filename += ".md"
-    docs = aw_list()["documents"]
-    for doc in docs:
-        if doc["filename"] == filename:
-            lines = doc["content"].split("\n")
-            match_idx = -1
-            for i, line in enumerate(lines):
-                if old_text.strip() in line:
-                    match_idx = i
-                    break
-            if match_idx == -1:
-                return f"no bullet matching '{old_text}' found in {filename}"
-            removed = lines.pop(match_idx)
-            content = "\n".join(lines)
-            aw_update(doc["$id"], {"content": content})
-            return f"deleted from {filename}: {removed.strip()}"
-    available = [d["filename"] for d in docs]
-    return f"'{filename}' not found. Available: {', '.join(available)}"
-
-
-def mcp_delete_section(filename, section):
-    if not filename.endswith(".md"):
-        filename += ".md"
-    docs = aw_list()["documents"]
-    for doc in docs:
-        if doc["filename"] == filename:
-            lines = doc["content"].split("\n")
-            section_lower = section.lower().strip().lstrip("#").strip()
-            start_idx = -1
-            for i, line in enumerate(lines):
-                if line.strip().startswith("##"):
-                    header_text = line.strip().lstrip("#").strip().lower()
-                    if header_text == section_lower:
-                        start_idx = i
-                        break
-            if start_idx == -1:
-                return f"section '{section}' not found in {filename}"
-            end_idx = start_idx + 1
-            while end_idx < len(lines):
-                if lines[end_idx].strip().startswith("##"):
-                    break
-                end_idx += 1
-            removed_count = sum(1 for l in lines[start_idx:end_idx] if l.strip().startswith("- "))
-            del lines[start_idx:end_idx]
-            content = "\n".join(lines)
-            aw_update(doc["$id"], {"content": content})
-            return f"deleted section '{section}' ({removed_count} bullets) from {filename}"
-    available = [d["filename"] for d in docs]
-    return f"'{filename}' not found. Available: {', '.join(available)}"
-
-
-def _set_line_importance(line, importance):
-    if "{{" not in line:
-        return stamp_bullet(line, importance=importance)
-    line = re.sub(r"\|t:\w+", "", line)
-    if re.search(r"\|i:\d", line):
-        return re.sub(r"\|i:\d+", "|i:" + str(importance), line)
-    return re.sub(r"(\{\{\d{4}-\d{2}-\d{2})", r"\1|i:" + str(importance), line, count=1)
-
-
-def mcp_set_importance(filename, bullet_text, importance):
-    if not filename.endswith(".md"):
-        filename += ".md"
-    importance = clamp_importance(importance)
-    docs = aw_list()["documents"]
-    for doc in docs:
-        if doc["filename"] == filename:
-            lines = doc["content"].split("\n")
-            for i, line in enumerate(lines):
-                if line.strip().startswith("- ") and bullet_text.strip() in line:
-                    lines[i] = _set_line_importance(line, importance)
-                    aw_update(doc["$id"], {"content": "\n".join(lines)})
-                    return f"set importance {importance} on: {bullet_text.strip()}"
-            return f"no bullet matching '{bullet_text}' in {filename}"
-    available = [d["filename"] for d in docs]
-    return f"'{filename}' not found. Available: {', '.join(available)}"
-
-
-def _d(fn, cluster=None, action="read"):
-    def wrapper(args):
-        result = fn(args)
-        c = args.get(cluster) if cluster else "all"
-        if c and not c.endswith(".md"):
-            c += ".md"
-        _track(c or "all", action, args.get("source", ""))
-        return result
-    return wrapper
-
-MCP_DISPATCH = {
-    "get_full_brain": _d(lambda args: mcp_get_full_brain()),
-    "get_cluster": _d(lambda args: mcp_get_cluster(args["filename"]), "filename", "read"),
-    "list_clusters": _d(lambda args: mcp_list_clusters()),
-    "search_brain": _d(lambda args: mcp_search_brain(args["query"])),
-    "get_context_for_topic": _d(lambda args: mcp_get_context_for_topic(args["topic"])),
-    "save_to_brain": _d(lambda args: mcp_save_to_brain(args["filename"], args["bullet"], args.get("importance", 3), args.get("expiry"), args.get("source"), args.get("section"), args.get("rec"), args.get("parent")), "filename", "write"),
-    "create_cluster": _d(lambda args: mcp_create_cluster(args["filename"], args["content"], args.get("source"), args.get("scope")), "filename", "write"),
-    "get_brain_summary": _d(lambda args: mcp_get_brain_summary()),
-    "edit_bullet": _d(lambda args: mcp_edit_bullet(args["filename"], args["old_text"], args["new_text"], args.get("source")), "filename", "write"),
-    "set_importance": _d(lambda args: mcp_set_importance(args["filename"], args["bullet_text"], args["importance"]), "filename", "write"),
-    "delete_bullet": _d(lambda args: mcp_delete_bullet(args["filename"], args["old_text"]), "filename", "write"),
-    "delete_section": _d(lambda args: mcp_delete_section(args["filename"], args["section"]), "filename", "write"),
-}
-
-
-
-
-def _track(cluster, action="read", source=""):
-    if not cluster:
+def _track(user_id, cluster, action="read", source=""):
+    if not cluster or not user_id:
         return
     try:
-        db_log_activity({"cluster": cluster, "action": action, "source": source, "ts": time.time()})
+        db_log_activity(user_id, {"cluster": cluster, "action": action, "source": source, "ts": time.time()})
     except Exception:
         pass
 
 @app.route("/activity", methods=["POST"])
 def post_activity():
-    key = request.headers.get("X-Api-Key", "")
-    authed = session.get("authenticated") or (
-        CORTEX_MCP_KEY and hmac.compare_digest(key.encode(), CORTEX_MCP_KEY.encode()))
-    if not authed:
+    uid = _uid_web() if (session.get("user_id") or _dev_mode()) else None
+    if not uid:
+        key = request.headers.get("X-Api-Key", "")
+        if key:
+            if CORTEX_MCP_KEY and hmac.compare_digest(key.encode(), CORTEX_MCP_KEY.encode()):
+                o = _owner()
+                uid = o["id"] if o else None
+            else:
+                u = user_by_key_hash(hash_key(key))
+                uid = u["id"] if u else None
+    if not uid:
         return jsonify({"error": "unauthorized"}), 401
     data = request.get_json(silent=True) or {}
-    _track(data.get("cluster", ""), data.get("action", "read"), data.get("source", ""))
+    _track(uid, data.get("cluster", ""), data.get("action", "read"), data.get("source", ""))
     return jsonify({"ok": True})
 
 @app.route("/activity", methods=["GET"])
 def get_activity():
-    if not session.get("authenticated"):
+    if not (session.get("user_id") or _dev_mode()):
         return jsonify([])
     try:
-        events = db_get_activity()
+        events = db_get_activity(_uid_web())
     except Exception:
         return jsonify([])
     cutoff = time.time() - 30
     return jsonify([e for e in events if e.get("ts", 0) > cutoff])
 
 
-_seeded = False
+_maintained = False
 
 @app.before_request
-def ensure_seeded():
-    global _seeded
-    if _seeded:
+def run_maintenance():
+    # seeding now happens per-user at signup; this only expires |x: bullets
+    global _maintained
+    if _maintained:
         return
-    _seeded = True
+    _maintained = True
     try:
-        seed_brain()
         auto_decay()
     except Exception:
         pass

@@ -1,16 +1,33 @@
 import sys
 import os
+import hmac
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from dotenv import load_dotenv
 load_dotenv(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env"))
 
+import mcp_server
 from mcp_server import mcp
+from db import hash_key, user_by_key_hash, user_owner
 
 CORTEX_MCP_KEY = os.getenv("CORTEX_MCP_KEY", "")
 
 _sdk_app = mcp.streamable_http_app()
 _handler = _sdk_app.routes[0].app
+
+_owner_cache = {}
+
+
+def _resolve_user(key):
+    """Map an API key to (user_id, role); None if invalid."""
+    if CORTEX_MCP_KEY and hmac.compare_digest(key.encode(), CORTEX_MCP_KEY.encode()):
+        # legacy owner key from env — resolves to the owner account
+        if "u" not in _owner_cache:
+            _owner_cache["u"] = user_owner()
+        o = _owner_cache["u"]
+        return (o["id"], "owner") if o else None
+    u = user_by_key_hash(hash_key(key))
+    return (u["id"], u["role"]) if u else None
 
 
 async def _send_json(send, status, body):
@@ -28,12 +45,6 @@ async def app(scope, receive, send):
         return await _sdk_app(scope, receive, send)
 
     if scope["type"] == "http":
-        # fail closed: no configured key means no access, not open access
-        if not CORTEX_MCP_KEY:
-            return await _send_json(send, 503, {
-                "jsonrpc": "2.0", "id": None,
-                "error": {"code": -32000, "message": "server not configured"},
-            })
         headers = dict(scope.get("headers", []))
         auth = headers.get(b"authorization", b"").decode()
         api_key = headers.get(b"x-api-key", b"").decode()
@@ -46,12 +57,19 @@ async def app(scope, receive, send):
         if not key:
             key = api_key
 
-        import hmac
-        if not key or not hmac.compare_digest(key.encode(), CORTEX_MCP_KEY.encode()):
+        user = _resolve_user(key) if key else None
+        if not user:
             return await _send_json(send, 401, {
                 "jsonrpc": "2.0", "id": None,
                 "error": {"code": -32000, "message": "unauthorized"},
             })
+
+        scope["path"] = "/"
+        tokens = mcp_server.set_request_user(user[0], user[1])
+        try:
+            return await _handler(scope, receive, send)
+        finally:
+            mcp_server.reset_request_user(tokens)
 
     scope["path"] = "/"
     return await _handler(scope, receive, send)
