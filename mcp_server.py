@@ -63,10 +63,19 @@ def reset_request_user(tokens):
     _role_ctx.reset(tokens[1])
 
 
+_IS_SERVER = bool(os.getenv("VERCEL") or os.getenv("VERCEL_ENV"))
+
+
 def _uid():
     uid = _user_ctx.get()
     if uid:
         return uid
+    # Deployed (HTTP) server: a tool must never run without a request-scoped
+    # user. The MCP route sets it and 401s otherwise, so reaching here means a
+    # bug — fail closed rather than silently defaulting to the owner's brain.
+    if _IS_SERVER:
+        raise RuntimeError("no authenticated user in request context")
+    # Local stdio (single-tenant, the owner's own machine): resolve the owner.
     global _stdio_uid
     if _stdio_uid is None:
         _stdio_uid = os.getenv("CORTEX_USER_ID", "")
@@ -321,6 +330,79 @@ def filter_by_scope(docs, scope):
     return [d for d in docs if get_scope(d, docs) in (scope, "all")]
 
 
+# Hard ceiling on any full-brain / multi-cluster read. Serverless functions and
+# MCP clients choke on huge payloads — a single unbounded read of the log
+# sub-clusters was ~420k chars (~105k tokens) and hung Vercel for minutes.
+READ_BUDGET = int(os.getenv("CORTEX_READ_BUDGET", "24000"))
+
+
+def _bullet_imp(line):
+    m = re.search(r"\|i:(\d)", line)
+    if m:
+        return _clamp_imp(m.group(1))
+    mt = re.search(r"\|t:(\w+)", line)
+    return {"core": 5, "active": 3, "ref": 2, "temp": 1}.get(mt.group(1) if mt else "", 3)
+
+
+def _assemble_budgeted(docs, budget, label="context"):
+    """Emit sections + bullets across docs, keeping the highest-importance
+    memories first, until the char budget is hit. Bounded by construction."""
+    entries = []  # (importance, order, filename, section, line)
+    order = 0
+    for doc in docs:
+        section = None
+        for line in doc["content"].split("\n"):
+            s = line.strip()
+            if not s or s.startswith("<!--"):
+                continue
+            if s.startswith("##"):
+                section = s
+            elif _is_bullet(line):
+                entries.append((_bullet_imp(line), order, doc["filename"], section, line.rstrip()))
+                order += 1
+    # rank: importance desc, then original order (stable, keeps nesting readable)
+    entries.sort(key=lambda e: (-e[0], e[1]))
+    keep = set()
+    used = 0
+    dropped = 0
+    for imp, o, fn, sec, line in entries:
+        cost = len(line) + 1
+        if used + cost <= budget:
+            keep.add(o)
+            used += cost
+        else:
+            dropped += 1
+    # re-emit in natural file -> section -> order sequence, included only
+    out = []
+    order = 0
+    by_file = {}
+    for doc in docs:
+        by_file.setdefault(doc["filename"], doc)
+    for doc in docs:
+        section = None
+        buf = []
+        for line in doc["content"].split("\n"):
+            s = line.strip()
+            if not s or s.startswith("<!--"):
+                continue
+            if s.startswith("##"):
+                section = line.rstrip()
+            elif _is_bullet(line):
+                if order in keep:
+                    if section is not None:
+                        buf.append(section)
+                        section = None
+                    buf.append(line.rstrip())
+                order += 1
+        if buf:
+            out.append(f"=== {doc['filename']} ===\n" + "\n".join(buf))
+    result = "\n\n".join(out) if out else f"no {label} found"
+    if dropped:
+        result += (f"\n\n[{dropped} lower-importance memories omitted to fit the read budget — "
+                   "use get_outline(cluster) then get_cluster/get_briefing for the full detail]")
+    return result
+
+
 
 
 def select_files(topic, docs, max_files=3):
@@ -356,8 +438,9 @@ mcp = FastMCP(
         "Every AI that connects shares it. Use it on EVERY message: read before you answer, save what you learn, keep it clean.\n\n"
 
         "=== EVERY MESSAGE ===\n"
-        "1. READ FIRST: call get_briefing(topic) for ranked, token-budgeted context; on your first message call get_brain_summary. "
-        "To navigate a big cluster, get_outline first (cheap map with ids), then read only what you need. "
+        "1. READ FIRST: call get_briefing(topic) for ranked, token-budgeted context - this is the primary read; on your first message call get_brain_summary. "
+        "To navigate a big cluster, get_outline first (cheap map with ids), then get_cluster only the sub-cluster you need. "
+        "get_full_brain and get_context_for_topic are bounded snapshots (not raw dumps); prefer get_briefing for a sharp answer. "
         "If a search returns nothing, get_cluster the likeliest cluster - empty results mean the words didn't match, not that the fact is absent. Don't answer from assumption.\n"
         "2. SAVE what's new: default to saving, skip only a pure generic question with zero personal content. Save facts, decisions, and recommendations you generate. Don't gatekeep - save it and rank it. "
         "Keep bullets SHORT (headline under ~600 chars); put detail in child bullets via parent=... - long essay-bullets bloat every future read.\n"
@@ -393,19 +476,17 @@ mcp = FastMCP(
 
 @mcp.tool()
 def get_full_brain(scope: str = "") -> str:
-    """Get ALL brain data across every cluster. Use this when you need comprehensive
-    context about the user — who they are, everything they're working on, their full
-    background. Returns all memory files with their contents.
-    Scope filters clusters: 'build' for project/code context, 'strategy' for
-    personal/life context. Empty string returns everything."""
+    """Get a broad, importance-ranked snapshot across every cluster. Bounded to a
+    fixed size — the highest-importance memories brain-wide, not a raw dump (a full
+    dump is ~500k chars and will time out). For a specific area use get_briefing or
+    get_cluster; to see everything in one cluster use get_outline + get_cluster.
+    Scope filters clusters: 'build' for project/code, 'strategy' for personal/life."""
     docs = filter_by_scope(aw_list(), scope)
-    parts = []
-    for doc in sorted(docs, key=lambda d: d["filename"]):
-        content = doc["content"]
-        lines = [l for l in content.split("\n") if not l.strip().startswith("<!--")]
-        parts.append(f"=== {doc['filename']} ===\n" + "\n".join(lines))
+    if not docs:
+        return "brain is empty"
+    for doc in docs:
         emit_activity(doc["filename"], "read")
-    return "\n\n".join(parts) if parts else "brain is empty"
+    return _assemble_budgeted(sorted(docs, key=lambda d: d["filename"]), READ_BUDGET, "brain data")
 
 
 @mcp.tool()
@@ -505,17 +586,17 @@ def search_brain(query: str, scope: str = "") -> str:
 
 @mcp.tool()
 def get_context_for_topic(topic: str, scope: str = "") -> str:
-    """Get brain data relevant to a specific topic. Automatically selects the
-    most relevant clusters based on keywords. Use this instead of get_full_brain
-    when you only need info about a specific area. Scope filters: 'build' or 'strategy'."""
+    """Get brain data relevant to a specific topic — the relevant clusters,
+    importance-ranked and bounded to a fixed size (never a raw dump; the log
+    sub-clusters alone are 400k+ chars). For the sharpest ranked result prefer
+    get_briefing. Scope filters: 'build' or 'strategy'."""
     docs = filter_by_scope(aw_list(), scope)
     selected = select_files(topic, docs, max_files=4)
-    parts = []
+    if not selected:
+        return f"no relevant data for '{topic}'"
     for doc in selected:
-        lines = [l for l in doc["content"].split("\n") if not l.strip().startswith("<!--")]
-        parts.append(f"=== {doc['filename']} ===\n" + "\n".join(lines))
         emit_activity(doc["filename"], "read")
-    return "\n\n".join(parts) if parts else f"no relevant data for '{topic}'"
+    return _assemble_budgeted(selected, READ_BUDGET, f"data for '{topic}'")
 
 
 def _compact_meta(line):
