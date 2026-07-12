@@ -17,7 +17,11 @@ MONGODB_COLLECTION = os.getenv("MONGODB_COLLECTION", "memories")
 def _client():
     if not MONGODB_URI:
         raise RuntimeError("MONGODB_URI not set — add it to .env")
-    return MongoClient(MONGODB_URI, appname="cortex", serverSelectionTimeoutMS=8000)
+    # fail fast on serverless: a dead/slow Atlas connection should surface as an
+    # error in seconds, never hang the function until the platform kills it.
+    return MongoClient(MONGODB_URI, appname="cortex",
+                       serverSelectionTimeoutMS=5000, connectTimeoutMS=5000,
+                       socketTimeoutMS=8000)
 
 
 @lru_cache(maxsize=1)

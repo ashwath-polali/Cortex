@@ -433,6 +433,10 @@ def select_files(topic, docs, max_files=3):
 mcp = FastMCP(
     "cortex",
     stateless_http=True,
+    # single JSON response per call, NOT an SSE stream — Vercel serverless buffers
+    # or kills long-lived text/event-stream responses, which hangs the client for
+    # its full timeout. JSON responses complete cleanly on serverless.
+    json_response=True,
     instructions=(
         "Cortex is the user's personal memory system - his external brain, stored in a database. "
         "Every AI that connects shares it. Use it on EVERY message: read before you answer, save what you learn, keep it clean.\n\n"

@@ -1,6 +1,7 @@
 import sys
 import os
 import hmac
+import anyio
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from dotenv import load_dotenv
@@ -57,7 +58,15 @@ async def app(scope, receive, send):
         if not key:
             key = api_key
 
-        user = _resolve_user(key) if key else None
+        # auth touches MongoDB (blocking pymongo) — run it off the event loop so a
+        # cold/slow connection can never stall the async transport. Fail closed.
+        user = None
+        if key:
+            try:
+                with anyio.fail_after(9):
+                    user = await anyio.to_thread.run_sync(_resolve_user, key)
+            except (TimeoutError, Exception):
+                user = None
         if not user:
             return await _send_json(send, 401, {
                 "jsonrpc": "2.0", "id": None,
