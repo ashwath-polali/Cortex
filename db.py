@@ -17,11 +17,13 @@ MONGODB_COLLECTION = os.getenv("MONGODB_COLLECTION", "memories")
 def _client():
     if not MONGODB_URI:
         raise RuntimeError("MONGODB_URI not set — add it to .env")
-    # fail fast on serverless: a dead/slow Atlas connection should surface as an
-    # error in seconds, never hang the function until the platform kills it.
+    # timeouts sized for a COLD Atlas M0 connection: the first TLS handshake from
+    # a fresh serverless instance measures ~8-9s, so anything under ~15s makes every
+    # cold call fail. Generous ceilings here; the caller (auth / tool) caps overall
+    # time. maxPoolSize small because each serverless instance handles one call.
     return MongoClient(MONGODB_URI, appname="cortex",
-                       serverSelectionTimeoutMS=5000, connectTimeoutMS=5000,
-                       socketTimeoutMS=8000)
+                       serverSelectionTimeoutMS=20000, connectTimeoutMS=20000,
+                       socketTimeoutMS=20000, maxPoolSize=5, retryWrites=True)
 
 
 @lru_cache(maxsize=1)
