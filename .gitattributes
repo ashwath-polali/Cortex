@@ -1,0 +1,8 @@
+# GitHub language stats (Linguist): exclude tests and one-off ops/migration
+# scripts from the language breakdown — they are not the application itself.
+# This affects only the profile/repo language bar; zero effect on any code,
+# behavior, or how the project runs.
+test_*.py    linguist-vendored
+migrate_*.py linguist-vendored
+upload_brain.py linguist-vendored
+backfill_ids.py linguist-vendored
