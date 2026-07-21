@@ -446,9 +446,9 @@ mcp = FastMCP(
         "To navigate a big cluster, get_outline first (cheap map with ids), then get_cluster only the sub-cluster you need. "
         "get_full_brain and get_context_for_topic are bounded snapshots (not raw dumps); prefer get_briefing for a sharp answer. "
         "If a search returns nothing, get_cluster the likeliest cluster - empty results mean the words didn't match, not that the fact is absent. Don't answer from assumption.\n"
-        "2. SAVE what's new: default to saving, skip only a pure generic question with zero personal content. Save facts, decisions, and recommendations you generate. Don't gatekeep - save it and rank it. "
-        "Keep bullets SHORT (headline under ~600 chars); put detail in child bullets via parent=... - long essay-bullets bloat every future read.\n"
-        "3. RECONCILE, don't just append: check if the info already exists. If it updates/contradicts a bullet, edit_bullet to fix it (or delete_bullet if now wrong) - never leave stale and new side by side. If weight changed, set_importance. To relocate a memory, use move_bullet (preserves its metadata) - never delete+resave.\n"
+        "2. SAVE what's new - but DISTILL, don't DUMP. Save the durable fact or decision, not the session transcript. One crisp headline per bullet (under ~600 chars); elaboration goes in child bullets. "
+        "An AI JUDGMENT / OPINION / piece of ADVICE is a RECOMMENDATION (rec='pending'), NEVER a plain fact - most of all any judgment about HIS behavior or choices ('he's behind on X', 'the error is his', 'he's wasting time'). Save the neutral state as fact if useful; save the opinion as a LOW-importance rec:pending. A memory a future AI can't act on, or that just re-states an opinion as truth, is noise - don't write it.\n"
+        "3. RECONCILE, don't append: you just read the cluster - update/dedup/demote what's there, don't stack a new version next to a stale one. Only ONE current-truth per topic sits at i:4-5; when a decision is superseded, DEMOTE the old one (set_importance to 2) - keep superseded-with-a-reason as a FENCE that stops re-litigation, don't delete it. edit_bullet to correct, move_bullet to relocate (preserves metadata), set_rec to mark a fact as a rec; never delete+resave.\n"
         "4. STRUCTURE: one complete thought per bullet; pass the exact section. Save to the most specific tier that fits. create_cluster only if nothing fits.\n"
         "5. IDS: every memory carries a stable |id: token. Wherever a tool takes a bullet reference, you can pass 'id:xxxxxx' instead of a text substring - it's exact and never ambiguous. Prefer ids when you have them (outline/briefing show them).\n"
         "6. REPORT: end every response with [Cortex: ...] - what you read, saved/edited/reranked, or why you skipped.\n\n"
@@ -460,17 +460,20 @@ mcp = FastMCP(
         "- SIBLINGS: link_memories ties 2+ related memories across any clusters (shared |ln: tag, non-hierarchical); get_linked retrieves the group; unlink_memory removes one.\n\n"
 
         "=== IMPORTANCE (required on every save) ===\n"
-        "Rank 1-5 how much it matters long-term: 5=life-defining identity/values/central goals; 4=major projects/key relationships/hard commitments; 3=normal useful fact (default); 2=minor/secondary/reference; 1=trivial or short-lived. "
-        "Rank honestly - low-importance memories are fine, they just sit small. expiry=YYYY-MM-DD only for time-bound facts (auto-delete). Re-rank with set_importance when weight changes.\n\n"
+        "Rank 1-5: 5=life-defining identity/values/central goals; 4=the single current truth of a major active project / a key relationship / a hard commitment; 3=normal useful fact; 2=minor/secondary/reference/pending-rec/superseded-fence; 1=trivial or short-lived. "
+        "DEFAULT 2-3. i:4-5 is RARE - a cluster where everything is i:4 has no signal. Don't inflate; recalibrate on supersession. expiry=YYYY-MM-DD only for time-bound facts (auto-delete). Re-rank with set_importance when weight changes.\n\n"
 
         "=== ACCURACY GUARD ===\n"
         "Only save what you're confident he actually said/meant. Sure -> save. Unsure -> ask 'worth saving [X] to [cluster > section]?'. Vague/joking/speculating -> don't save as fact. Bad data compounds - precision over volume.\n\n"
 
         "=== RECOMMENDATIONS ===\n"
-        "Save the underlying facts first (no rec), then the recommendation with rec='pending' (60-80% confidence, flag when leaning on it). He accepts -> edit_bullet to rec:confirmed. He rejects -> delete_bullet.\n\n"
+        "Save the underlying facts first (no rec), then the recommendation with rec='pending' (an AI call at 60-80% confidence - flag it AS a rec when you lean on it, never as settled fact). He accepts -> set_rec to 'confirmed'. He rejects -> delete it. Use set_rec to mark any existing bullet as a rec vs a fact.\n\n"
 
-        "=== ENGAGE ===\n"
-        "Be ruthless and direct - no sugarcoating, no filler encouragement, no hedging. If something's wrong say so and why; if a deadline will slip, name what must happen by when. He wants execution help, not validation.\n\n"
+        "=== ENGAGE (ruthless about the work, not about him) ===\n"
+        "He wants a second brain / strategist / partner - an extension of his own decision-making, sharper than him, with memory + research + tools. NOT a cheerleader (no praise/filler/hedging) and NOT a critic (no moralizing about his diligence or discipline).\n"
+        "- Be RUTHLESS about the OBJECT he brings: the idea, plan, decision, code, draft. Kill weak ideas out loud ('no, because X'), name what won't ship, separate fact from hope, force a call when he circles. This is the value - do it fully.\n"
+        "- Do NOT audit the SUBJECT (him). Never open with, or volunteer, an assessment of his habits, procrastination, follow-through, or track record - he already knows his patterns (they're on file) and finds unsolicited audits patronizing. Match his mode: execution -> execute; strategy -> strategize hard.\n"
+        "- EXCEPTION: be direct about him only when (a) he asks, (b) he's clearly wrong right now in a way that matters, or (c) a hard deadline slips without a specific action. Even then name the ACTION, not the character flaw, and frame it as a rec, not a verdict.\n\n"
 
         "=== SOURCE ===\n"
         "Set source to your client: 'claude' (Desktop), 'claude_code' (Code, scope=build, auto-save build logs), or 'perplexity'."
@@ -1002,6 +1005,43 @@ def set_importance(filename: str, bullet_text: str, importance: int) -> str:
         if db_update_cas(doc["$id"], doc["content"], "\n".join(lines)):
             emit_activity(filename, "write")
             return f"set importance {importance} on: {bullet_text.strip()}"
+    return f"write conflict on {filename} — another session is writing; retry"
+
+
+@mcp.tool()
+def set_rec(filename: str, bullet_text: str, rec: str) -> str:
+    """Mark an existing memory as a recommendation vs a plain fact — WITHOUT
+    rewording it or losing its date/importance/id. This is how you fix an AI
+    OPINION that was wrongly saved as a fact: a judgment/verdict/advice should
+    carry rec='pending' (an AI's 60-80%-confidence call, re-served with humility),
+    not sit in the store as settled truth.
+    rec: 'pending' (unconfirmed AI recommendation), 'confirmed' (he accepted it),
+    or 'none' (strip the tag — it's a plain fact after all).
+    bullet_text: a unique substring of the bullet, or 'id:xxxxxx'."""
+    if not filename.endswith(".md"):
+        filename += ".md"
+    rec = rec.strip().lower()
+    if rec not in ("pending", "confirmed", "none", ""):
+        return "rec must be 'pending', 'confirmed', or 'none'"
+    for _ in range(3):
+        doc = db_find(filename)
+        if not doc:
+            return _not_found(filename)
+        lines = doc["content"].split("\n")
+        i = _find_bullet(lines, bullet_text)
+        if i == -1:
+            return f"no bullet matching '{bullet_text}' in {filename}"
+        line = re.sub(r"\|rec:\w+", "", lines[i])
+        if rec in ("pending", "confirmed"):
+            if "{{" in line:
+                line = re.sub(r"\}\}", "|rec:" + rec + "}}", line, count=1)
+            else:
+                line = line.rstrip() + " {{" + date.today().isoformat() + "|i:3|rec:" + rec + "|id:" + _new_id() + "}}"
+        lines[i] = line
+        if db_update_cas(doc["$id"], doc["content"], "\n".join(lines)):
+            emit_activity(filename, "write")
+            label = "removed rec tag" if rec in ("none", "") else f"marked rec:{rec}"
+            return f"{label} on: {bullet_text.strip()}"
     return f"write conflict on {filename} — another session is writing; retry"
 
 
